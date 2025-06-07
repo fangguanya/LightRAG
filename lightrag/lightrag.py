@@ -941,6 +941,7 @@ class LightRAG:
                                 pipeline_status["history_messages"].append(log_message)
 
                             # Generate chunks from document
+                            logger.info(f"开始对文档 {doc_id} 进行分块处理...")
                             chunks: dict[str, Any] = {
                                 compute_mdhash_id(dp["content"], prefix="chunk-"): {
                                     **dp,
@@ -956,8 +957,10 @@ class LightRAG:
                                     self.chunk_token_size,
                                 )
                             }
+                            logger.info(f"文档 {doc_id} 分块完成，生成 {len(chunks)} 个文本块")
 
                             # Process document (text chunks and full docs) in parallel
+                            logger.info(f"开始并行处理文档 {doc_id}：文档状态更新、块向量化、实体关系抽取、原文存储")
                             # Create tasks with references for potential cancellation
                             doc_status_task = asyncio.create_task(
                                 self.doc_status.upsert(
@@ -1000,7 +1003,9 @@ class LightRAG:
                                 full_docs_task,
                                 text_chunks_task,
                             ]
+                            logger.info(f"启动文档 {doc_id} 的 {len(tasks)} 个并行处理任务")
                             await asyncio.gather(*tasks)
+                            logger.info(f"文档 {doc_id} 的所有并行任务完成")
                             file_extraction_stage_ok = True
 
                         except Exception as e:
@@ -1051,8 +1056,10 @@ class LightRAG:
 
                     if file_extraction_stage_ok:
                         try:
+                            logger.info(f"文档 {doc_id} 开始进入合并阶段...")
                             # Get chunk_results from entity_relation_task
                             chunk_results = await entity_relation_task
+                            logger.info(f"文档 {doc_id} 实体抽取完成，开始合并节点和边...")
                             await merge_nodes_and_edges(
                                 chunk_results=chunk_results,  # result collected from entity_relation_task
                                 knowledge_graph_inst=self.chunk_entity_relation_graph,
@@ -1066,6 +1073,7 @@ class LightRAG:
                                 total_files=total_files,
                                 file_path=file_path,
                             )
+                            logger.info(f"文档 {doc_id} 节点和边合并完成")
 
                             await self.doc_status.upsert(
                                 {
@@ -1085,7 +1093,9 @@ class LightRAG:
                             )
 
                             # Call _insert_done after processing each file
+                            logger.info(f"文档 {doc_id} 调用最终处理完成回调...")
                             await self._insert_done()
+                            logger.info(f"文档 {doc_id} 处理完全完成")
 
                             async with pipeline_status_lock:
                                 log_message = f"Completed processing file {current_file_number}/{total_files}: {file_path}"

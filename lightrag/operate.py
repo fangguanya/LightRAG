@@ -5,7 +5,7 @@ import asyncio
 import json
 import re
 import os
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Dict, List
 from collections import Counter, defaultdict
 
 from .utils import (
@@ -51,19 +51,31 @@ def chunking_by_token_size(
     overlap_token_size: int = 128,
     max_token_size: int = 1024,
 ) -> list[dict[str, Any]]:
+    logger.info(f"开始文本分块，目标分块大小: {max_token_size} tokens，重叠大小: {overlap_token_size} tokens")
+    
     tokens = tokenizer.encode(content)
+    logger.info(f"文本总长度: {len(tokens)} tokens")
+    
     results: list[dict[str, Any]] = []
     if split_by_character:
+        logger.info(f"使用分隔符进行分块: '{split_by_character}'")
         raw_chunks = content.split(split_by_character)
+        logger.info(f"按分隔符分割得到 {len(raw_chunks)} 个初始块")
+        
         new_chunks = []
         if split_by_character_only:
+            logger.info("仅按分隔符分块，不进行token大小检查")
             for chunk in raw_chunks:
                 _tokens = tokenizer.encode(chunk)
                 new_chunks.append((len(_tokens), chunk))
         else:
+            logger.info("按分隔符分块后，检查token大小并进一步分割")
+            oversized_count = 0
             for chunk in raw_chunks:
                 _tokens = tokenizer.encode(chunk)
                 if len(_tokens) > max_token_size:
+                    oversized_count += 1
+                    logger.debug(f"发现超大块 ({len(_tokens)} tokens)，进行二次分割")
                     for start in range(
                         0, len(_tokens), max_token_size - overlap_token_size
                     ):
@@ -75,6 +87,9 @@ def chunking_by_token_size(
                         )
                 else:
                     new_chunks.append((len(_tokens), chunk))
+            if oversized_count > 0:
+                logger.info(f"对 {oversized_count} 个超大块进行了二次分割")
+        
         for index, (_len, chunk) in enumerate(new_chunks):
             results.append(
                 {
@@ -83,7 +98,9 @@ def chunking_by_token_size(
                     "chunk_order_index": index,
                 }
             )
+        logger.info(f"分块处理完成，最终得到 {len(results)} 个块")
     else:
+        logger.info("按token大小直接分块")
         for index, start in enumerate(
             range(0, len(tokens), max_token_size - overlap_token_size)
         ):
@@ -95,6 +112,8 @@ def chunking_by_token_size(
                     "chunk_order_index": index,
                 }
             )
+        logger.info(f"按token分块完成，得到 {len(results)} 个块")
+    
     return results
 
 
@@ -527,6 +546,8 @@ async def merge_nodes_and_edges(
         pipeline_status_lock: Lock for pipeline status
         llm_response_cache: LLM response cache
     """
+    logger.info(f"开始合并 {len(chunk_results)} 个块的提取结果...")
+    
     # Get lock manager from shared storage
     from .kg.shared_storage import get_graph_db_lock
 
@@ -534,6 +555,7 @@ async def merge_nodes_and_edges(
     all_nodes = defaultdict(list)
     all_edges = defaultdict(list)
 
+    logger.info("正在收集所有节点和边...")
     for maybe_nodes, maybe_edges in chunk_results:
         # Collect nodes
         for entity_name, entities in maybe_nodes.items():
@@ -544,14 +566,18 @@ async def merge_nodes_and_edges(
             sorted_edge_key = tuple(sorted(edge_key))
             all_edges[sorted_edge_key].extend(edges)
 
+    logger.info(f"收集完成: {len(all_nodes)} 个唯一实体, {len(all_edges)} 个唯一关系")
+
     # Centralized processing of all nodes and edges
     entities_data = []
     relationships_data = []
 
+    logger.info("获取图数据库锁...")
     # Merge nodes and edges
     # Use graph database lock to ensure atomic merges and updates
     graph_db_lock = get_graph_db_lock(enable_logging=False)
     async with graph_db_lock:
+        logger.info("成功获取图数据库锁，开始合并操作")
         async with pipeline_status_lock:
             log_message = (
                 f"Merging stage {current_file_number}/{total_files}: {file_path}"
@@ -560,6 +586,7 @@ async def merge_nodes_and_edges(
             pipeline_status["latest_message"] = log_message
             pipeline_status["history_messages"].append(log_message)
 
+        logger.info(f"开始处理 {len(all_nodes)} 个实体...")
         # Process and update all entities at once
         for entity_name, entities in all_nodes.items():
             entity_data = await _merge_nodes_then_upsert(
@@ -573,6 +600,7 @@ async def merge_nodes_and_edges(
             )
             entities_data.append(entity_data)
 
+        logger.info(f"开始处理 {len(all_edges)} 个关系...")
         # Process and update all relationships at once
         for edge_key, edges in all_edges.items():
             edge_data = await _merge_edges_then_upsert(
@@ -599,8 +627,10 @@ async def merge_nodes_and_edges(
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
 
+        logger.info(f"图合并完成，开始更新向量数据库...")
         # Update vector databases with all collected data
         if entity_vdb is not None and entities_data:
+            logger.info(f"准备更新实体向量数据库，共 {len(entities_data)} 个实体...")
             data_for_vdb = {
                 compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
                     "entity_name": dp["entity_name"],
@@ -611,7 +641,9 @@ async def merge_nodes_and_edges(
                 }
                 for dp in entities_data
             }
+            logger.info(f"开始向实体向量数据库插入 {len(data_for_vdb)} 条记录...")
             await entity_vdb.upsert(data_for_vdb)
+            logger.info("实体向量数据库更新完成")
 
         log_message = f"Updating {total_relations_count} relations {current_file_number}/{total_files}: {file_path}"
         logger.info(log_message)
@@ -621,6 +653,7 @@ async def merge_nodes_and_edges(
                 pipeline_status["history_messages"].append(log_message)
 
         if relationships_vdb is not None and relationships_data:
+            logger.info(f"准备更新关系向量数据库，共 {len(relationships_data)} 个关系...")
             data_for_vdb = {
                 compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
                     "src_id": dp["src_id"],
@@ -632,7 +665,11 @@ async def merge_nodes_and_edges(
                 }
                 for dp in relationships_data
             }
+            logger.info(f"开始向关系向量数据库插入 {len(data_for_vdb)} 条记录...")
             await relationships_vdb.upsert(data_for_vdb)
+            logger.info("关系向量数据库更新完成")
+
+    logger.info(f"合并操作全部完成！处理了 {len(entities_data)} 个实体和 {len(relationships_data)} 个关系")
 
 
 async def extract_entities(
@@ -642,10 +679,14 @@ async def extract_entities(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
 ) -> list:
+    logger.info(f"开始实体抽取阶段，共 {len(chunks)} 个文本块待处理")
+    
     use_llm_func: callable = global_config["llm_model_func"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
 
     ordered_chunks = list(chunks.items())
+    logger.info(f"实体抽取配置：最大gleaning轮数 = {entity_extract_max_gleaning}")
+    
     # add language and example number params to prompt
     language = global_config["addon_params"].get(
         "language", PROMPTS["DEFAULT_LANGUAGE"]
@@ -747,11 +788,14 @@ async def extract_entities(
         # Get file path from chunk data or use default
         file_path = chunk_dp.get("file_path", "unknown_source")
 
+        logger.debug(f"开始处理块 {chunk_key}，内容长度: {len(content)} 字符")
+
         # Get initial extraction
         hint_prompt = entity_extract_prompt.format(
             **{**context_base, "input_text": content}
         )
 
+        logger.debug(f"块 {chunk_key}: 发送初始抽取请求到LLM")
         final_result = await use_llm_func_with_cache(
             hint_prompt,
             use_llm_func,
@@ -761,12 +805,14 @@ async def extract_entities(
         history = pack_user_ass_to_openai_messages(hint_prompt, final_result)
 
         # Process initial extraction with file path
+        logger.debug(f"块 {chunk_key}: 处理初始抽取结果")
         maybe_nodes, maybe_edges = await _process_extraction_result(
             final_result, chunk_key, file_path
         )
 
         # Process additional gleaning results
         for now_glean_index in range(entity_extract_max_gleaning):
+            logger.debug(f"块 {chunk_key}: 开始第 {now_glean_index + 1} 轮gleaning抽取")
             glean_result = await use_llm_func_with_cache(
                 continue_prompt,
                 use_llm_func,
@@ -778,6 +824,7 @@ async def extract_entities(
             history += pack_user_ass_to_openai_messages(continue_prompt, glean_result)
 
             # Process gleaning result separately with file path
+            logger.debug(f"块 {chunk_key}: 处理第 {now_glean_index + 1} 轮gleaning结果")
             glean_nodes, glean_edges = await _process_extraction_result(
                 glean_result, chunk_key, file_path
             )
@@ -857,6 +904,7 @@ async def extract_entities(
     chunk_results = [task.result() for task in tasks]
 
     # Return the chunk_results for later processing in merge_nodes_and_edges
+    logger.info(f"实体抽取阶段完成，处理了 {len(chunk_results)} 个块的结果")
     return chunk_results
 
 
@@ -872,6 +920,8 @@ async def kg_query(
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
 ) -> str | AsyncIterator[str]:
+    logger.info(f"开始知识图谱查询，模式: {query_param.mode}，查询: {query[:50]}...")
+    
     if query_param.model_func:
         use_model_func = query_param.model_func
     else:
@@ -1898,6 +1948,8 @@ async def naive_query(
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
 ) -> str | AsyncIterator[str]:
+    logger.info(f"开始简单查询模式：{query[:50]}...")
+    
     if query_param.model_func:
         use_model_func = query_param.model_func
     else:
@@ -1915,12 +1967,16 @@ async def naive_query(
 
     tokenizer: Tokenizer = global_config["tokenizer"]
 
+    logger.info("获取向量上下文...")
     _, _, text_units_context = await _get_vector_context(
         query, chunks_vdb, query_param, tokenizer
     )
 
     if text_units_context is None or len(text_units_context) == 0:
+        logger.warning("未找到相关文本块，返回失败响应")
         return PROMPTS["fail_response"]
+    
+    logger.info(f"找到 {len(text_units_context)} 个相关文本块")
 
     text_units_str = json.dumps(text_units_context, ensure_ascii=False)
     if query_param.only_need_context:
