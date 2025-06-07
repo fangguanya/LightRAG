@@ -2,6 +2,8 @@ from ..utils import verbose_debug, VERBOSE_DEBUG
 import sys
 import os
 import logging
+import asyncio
+import time
 
 if sys.version_info < (3, 9):
     from typing import AsyncIterator
@@ -30,6 +32,8 @@ from lightrag.utils import (
     locate_json_string_body_from_string,
     safe_unicode_decode,
     logger,
+    EmbeddingFunc,
+    compute_mdhash_id,
 )
 from lightrag.types import GPTKeywordExtractionFormat
 from lightrag.api import __api_version__
@@ -43,6 +47,65 @@ from dotenv import load_dotenv
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=".env", override=False)
+
+# Default embedding model
+OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+
+# Global LLM request rate limiter
+class LLMRateLimiter:
+    def __init__(self, rpm: int = 1000, tpm: int = 10000):
+        self.rpm = rpm  # 每分钟请求数限制
+        self.tpm = tpm  # 每分钟token数限制
+        self.request_times = []  # 请求时间记录
+        self.token_usage = []   # token使用记录
+        self.lock = asyncio.Lock()
+    
+    def estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
+        """预估消息的token数量（简单估算：1个token约等于4个字符）"""
+        total_chars = 0
+        for message in messages:
+            if isinstance(message.get("content"), str):
+                total_chars += len(message["content"])
+        return max(1, total_chars // 4)
+    
+    async def acquire(self, messages: list[dict[str, Any]]):
+        """获取请求许可，确保不超过频率限制"""
+        async with self.lock:
+            current_time = time.time()
+            estimated_tokens = self.estimate_tokens(messages)
+            
+            # 清理1分钟前的记录
+            cutoff_time = current_time - 60
+            self.request_times = [t for t in self.request_times if t > cutoff_time]
+            self.token_usage = [(t, tokens) for t, tokens in self.token_usage if t > cutoff_time]
+            
+            # 检查RPM限制
+            if len(self.request_times) >= self.rpm:
+                wait_time = 60 - (current_time - self.request_times[0])
+                if wait_time > 0:
+                    logger.info(f"⏰ LLM RPM限制，等待 {wait_time:.2f} 秒")
+                    await asyncio.sleep(wait_time)
+                    return await self.acquire(messages)
+            
+            # 检查TPM限制
+            current_tokens = sum(tokens for _, tokens in self.token_usage)
+            if current_tokens + estimated_tokens > self.tpm:
+                if self.token_usage:
+                    wait_time = 60 - (current_time - self.token_usage[0][0])
+                    if wait_time > 0:
+                        logger.info(f"⏰ LLM TPM限制，当前tokens: {current_tokens}, 预估需要: {estimated_tokens}, 等待 {wait_time:.2f} 秒")
+                        await asyncio.sleep(wait_time)
+                        return await self.acquire(messages)
+            
+            # 记录本次请求
+            self.request_times.append(current_time)
+            self.token_usage.append((current_time, estimated_tokens))
+            
+            # 添加基础间隔，避免请求过于密集
+            await asyncio.sleep(0.1)
+
+# 全局LLM频率限制器实例（设置为限制的80%，留出安全边际）
+llm_rate_limiter = LLMRateLimiter(rpm=100, tpm=4000000)
 
 
 class InvalidResponseError(Exception):
@@ -97,8 +160,8 @@ def create_openai_async_client(
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(5),  # 增加重试次数
+    wait=wait_exponential(multiplier=2, min=4, max=120),  # 增加最大等待时间
     retry=(
         retry_if_exception_type(RateLimitError)
         | retry_if_exception_type(APIConnectionError)
@@ -168,6 +231,9 @@ async def openai_complete_if_cache(
     messages.extend(history_messages)
     messages.append({"role": "user", "content": prompt})
 
+    # 请求频率控制
+    await llm_rate_limiter.acquire(messages)
+
     logger.debug("===== Entering func of LLM =====")
     logger.debug(f"Model: {model}   Base URL: {base_url}")
     logger.debug(f"Additional kwargs: {kwargs}")
@@ -191,8 +257,15 @@ async def openai_complete_if_cache(
         await openai_async_client.close()  # Ensure client is closed
         raise
     except RateLimitError as e:
-        logger.error(f"OpenAI API Rate Limit Error: {e}")
+        logger.warning(f"⚠️ OpenAI API Rate Limit Error: {e}")
         await openai_async_client.close()  # Ensure client is closed
+        
+        # 智能等待处理429错误
+        if "429" in str(e):
+            wait_time = 60  # 默认等待60秒
+            #logger.info(f"⏳ 由于429错误，等待 {wait_time} 秒后重试")
+            await asyncio.sleep(wait_time)
+        
         raise
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
@@ -293,9 +366,9 @@ async def openai_complete_if_cache(
             content = response.choices[0].message.content
 
             if not content or content.strip() == "":
-                logger.error("Received empty content from OpenAI API")
+                logger.error(f"Received empty content from OpenAI API Model: {model}   Base URL: {base_url} Additional kwargs: {kwargs}")
                 await openai_async_client.close()  # Ensure client is closed
-                raise InvalidResponseError("Received empty content from OpenAI API")
+                raise InvalidResponseError(f"Received empty content from OpenAI API Model: {model}   Base URL: {base_url} Additional kwargs: {kwargs}")
 
             if r"\u" in content:
                 content = safe_unicode_decode(content.encode("utf-8"))
@@ -393,17 +466,16 @@ async def nvidia_openai_complete(
     if history_messages is None:
         history_messages = []
     keyword_extraction = kwargs.pop("keyword_extraction", None)
-    result = await openai_complete_if_cache(
-        "nvidia/llama-3.1-nemotron-70b-instruct",  # context length 128k
+    if keyword_extraction:
+        kwargs["response_format"] = "json"
+    model_name = kwargs["hashing_kv"].global_config["llm_model_name"]
+    return await openai_complete_if_cache(
+        model_name,
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
-        base_url="https://integrate.api.nvidia.com/v1",
         **kwargs,
     )
-    if keyword_extraction:  # TODO: use JSON API
-        return locate_json_string_body_from_string(result)
-    return result
 
 
 @wrap_embedding_func_with_attrs(embedding_dim=1536, max_token_size=8192)

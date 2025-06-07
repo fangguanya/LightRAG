@@ -88,7 +88,7 @@ def create_app(args):
     ]:
         raise Exception("llm binding not supported")
 
-    if args.embedding_binding not in ["lollms", "ollama", "openai", "azure_openai"]:
+    if args.embedding_binding not in ["lollms", "ollama", "openai", "azure_openai", "siliconflow"]:
         raise Exception("embedding binding not supported")
 
     # Set default hosts if not provided
@@ -204,6 +204,8 @@ def create_app(args):
         from lightrag.llm.ollama import ollama_model_complete, ollama_embed
     if args.llm_binding == "openai" or args.embedding_binding == "openai":
         from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+    if args.embedding_binding == "siliconflow":
+        from lightrag.llm.siliconcloud import siliconcloud_embedding
     if args.llm_binding == "azure_openai" or args.embedding_binding == "azure_openai":
         from lightrag.llm.azure_openai import (
             azure_openai_complete_if_cache,
@@ -283,6 +285,13 @@ def create_app(args):
             api_key=args.embedding_binding_api_key,
         )
         if args.embedding_binding == "azure_openai"
+        else siliconcloud_embedding(
+            texts,
+            model=args.embedding_model,
+            api_key=args.embedding_binding_api_key,
+            max_token_size=args.max_embed_tokens,
+        )
+        if args.embedding_binding == "siliconflow"
         else openai_embed(
             texts,
             model=args.embedding_model,
