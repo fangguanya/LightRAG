@@ -7,6 +7,7 @@ import re
 import os
 from typing import Any, AsyncIterator, Dict, List
 from collections import Counter, defaultdict
+import traceback
 
 from .utils import (
     logger,
@@ -155,7 +156,7 @@ async def _handle_entity_relation_summary(
         language=language,
     )
     use_prompt = prompt_template.format(**context_base)
-    logger.debug(f"Trigger summary: {entity_or_relation_name}")
+    logger.info(f"正在为实体/关系 '{entity_or_relation_name}' 生成LLM摘要（描述长度: {len(tokens)} tokens）")
 
     # Use LLM function with cache (higher priority for summary generation)
     summary = await use_llm_func_with_cache(
@@ -165,6 +166,7 @@ async def _handle_entity_relation_summary(
         max_tokens=summary_max_tokens,
         cache_type="extract",
     )
+    logger.info(f"LLM摘要完成: '{entity_or_relation_name}' （摘要长度: {len(summary)} 字符）")
     return summary
 
 
@@ -546,36 +548,62 @@ async def merge_nodes_and_edges(
         pipeline_status_lock: Lock for pipeline status
         llm_response_cache: LLM response cache
     """
+    logger.info(f"===== 进入merge_nodes_and_edges函数 =====")
+    logger.info(f"参数检查 - chunk_results类型: {type(chunk_results)}, 长度: {len(chunk_results) if chunk_results else 'None'}")
+    logger.info(f"参数检查 - knowledge_graph_inst: {type(knowledge_graph_inst)}")
+    logger.info(f"参数检查 - entity_vdb: {type(entity_vdb)}")
+    logger.info(f"参数检查 - relationships_vdb: {type(relationships_vdb)}")
+    logger.info(f"参数检查 - current_file_number: {current_file_number}, total_files: {total_files}")
+    logger.info(f"参数检查 - file_path: {file_path}")
+    
     logger.info(f"开始合并 {len(chunk_results)} 个块的提取结果...")
     
     # Get lock manager from shared storage
+    logger.info("正在导入get_graph_db_lock...")
     from .kg.shared_storage import get_graph_db_lock
+    logger.info("成功导入get_graph_db_lock")
 
     # Collect all nodes and edges from all chunks
     all_nodes = defaultdict(list)
     all_edges = defaultdict(list)
 
     logger.info("正在收集所有节点和边...")
-    for maybe_nodes, maybe_edges in chunk_results:
-        # Collect nodes
-        for entity_name, entities in maybe_nodes.items():
-            all_nodes[entity_name].extend(entities)
+    try:
+        for i, (maybe_nodes, maybe_edges) in enumerate(chunk_results):
+            if i % 500 == 0:  # 每500个块打印一次进度
+                logger.info(f"正在处理第 {i+1}/{len(chunk_results)} 个块的结果")
+            
+            # Collect nodes
+            for entity_name, entities in maybe_nodes.items():
+                all_nodes[entity_name].extend(entities)
 
-        # Collect edges with sorted keys for undirected graph
-        for edge_key, edges in maybe_edges.items():
-            sorted_edge_key = tuple(sorted(edge_key))
-            all_edges[sorted_edge_key].extend(edges)
-
-    logger.info(f"收集完成: {len(all_nodes)} 个唯一实体, {len(all_edges)} 个唯一关系")
+            # Collect edges with sorted keys for undirected graph
+            for edge_key, edges in maybe_edges.items():
+                sorted_edge_key = tuple(sorted(edge_key))
+                all_edges[sorted_edge_key].extend(edges)
+        
+        logger.info(f"收集完成: {len(all_nodes)} 个唯一实体, {len(all_edges)} 个唯一关系")
+    except Exception as e:
+        logger.error(f"收集节点和边时发生错误: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
 
     # Centralized processing of all nodes and edges
     entities_data = []
     relationships_data = []
 
     logger.info("获取图数据库锁...")
-    # Merge nodes and edges
-    # Use graph database lock to ensure atomic merges and updates
-    graph_db_lock = get_graph_db_lock(enable_logging=False)
+    try:
+        # Merge nodes and edges
+        # Use graph database lock to ensure atomic merges and updates
+        graph_db_lock = get_graph_db_lock(enable_logging=False)
+        logger.info(f"成功获取图数据库锁: {type(graph_db_lock)}")
+    except Exception as e:
+        logger.error(f"获取图数据库锁时发生错误: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+    
+    logger.info("准备进入图数据库锁的异步上下文...")
     async with graph_db_lock:
         logger.info("成功获取图数据库锁，开始合并操作")
         async with pipeline_status_lock:
@@ -588,7 +616,13 @@ async def merge_nodes_and_edges(
 
         logger.info(f"开始处理 {len(all_nodes)} 个实体...")
         # Process and update all entities at once
+        total_entities = len(all_nodes)
+        processed_entities = 0
         for entity_name, entities in all_nodes.items():
+            processed_entities += 1
+            if processed_entities % 100 == 0 or processed_entities == total_entities:
+                logger.info(f"正在处理实体: {processed_entities}/{total_entities} ({processed_entities/total_entities*100:.1f}%)")
+            
             entity_data = await _merge_nodes_then_upsert(
                 entity_name,
                 entities,
@@ -599,10 +633,17 @@ async def merge_nodes_and_edges(
                 llm_response_cache,
             )
             entities_data.append(entity_data)
+        logger.info(f"实体处理完成: {total_entities}/{total_entities} (100.0%)")
 
         logger.info(f"开始处理 {len(all_edges)} 个关系...")
         # Process and update all relationships at once
+        total_edges = len(all_edges)
+        processed_edges = 0
         for edge_key, edges in all_edges.items():
+            processed_edges += 1
+            if processed_edges % 100 == 0 or processed_edges == total_edges:
+                logger.info(f"正在处理关系: {processed_edges}/{total_edges} ({processed_edges/total_edges*100:.1f}%)")
+            
             edge_data = await _merge_edges_then_upsert(
                 edge_key[0],
                 edge_key[1],
@@ -615,6 +656,7 @@ async def merge_nodes_and_edges(
             )
             if edge_data is not None:
                 relationships_data.append(edge_data)
+        logger.info(f"关系处理完成: {total_edges}/{total_edges} (100.0%)")
 
         # Update total counts
         total_entities_count = len(entities_data)
@@ -631,19 +673,28 @@ async def merge_nodes_and_edges(
         # Update vector databases with all collected data
         if entity_vdb is not None and entities_data:
             logger.info(f"准备更新实体向量数据库，共 {len(entities_data)} 个实体...")
-            data_for_vdb = {
-                compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
-                    "entity_name": dp["entity_name"],
-                    "entity_type": dp["entity_type"],
-                    "content": f"{dp['entity_name']}\n{dp['description']}",
-                    "source_id": dp["source_id"],
-                    "file_path": dp.get("file_path", "unknown_source"),
+            logger.info("正在构建实体向量数据结构...")
+            try:
+                data_for_vdb = {
+                    compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
+                        "entity_name": dp["entity_name"],
+                        "entity_type": dp["entity_type"],
+                        "content": f"{dp['entity_name']}\n{dp['description']}",
+                        "source_id": dp["source_id"],
+                        "file_path": dp.get("file_path", "unknown_source"),
+                    }
+                    for dp in entities_data
                 }
-                for dp in entities_data
-            }
-            logger.info(f"开始向实体向量数据库插入 {len(data_for_vdb)} 条记录...")
-            await entity_vdb.upsert(data_for_vdb)
-            logger.info("实体向量数据库更新完成")
+                logger.info(f"实体向量数据结构构建完成，共 {len(data_for_vdb)} 条记录")
+                logger.info(f"开始向实体向量数据库插入 {len(data_for_vdb)} 条记录...")
+                await entity_vdb.upsert(data_for_vdb)
+                logger.info("实体向量数据库更新完成")
+            except Exception as e:
+                logger.error(f"更新实体向量数据库时发生错误: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise
+        else:
+            logger.info(f"跳过实体向量数据库更新 - entity_vdb: {entity_vdb is not None}, entities_data: {len(entities_data) if entities_data else 0}")
 
         log_message = f"Updating {total_relations_count} relations {current_file_number}/{total_files}: {file_path}"
         logger.info(log_message)
@@ -654,22 +705,32 @@ async def merge_nodes_and_edges(
 
         if relationships_vdb is not None and relationships_data:
             logger.info(f"准备更新关系向量数据库，共 {len(relationships_data)} 个关系...")
-            data_for_vdb = {
-                compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
-                    "src_id": dp["src_id"],
-                    "tgt_id": dp["tgt_id"],
-                    "keywords": dp["keywords"],
-                    "content": f"{dp['src_id']}\t{dp['tgt_id']}\n{dp['keywords']}\n{dp['description']}",
-                    "source_id": dp["source_id"],
-                    "file_path": dp.get("file_path", "unknown_source"),
+            logger.info("正在构建关系向量数据结构...")
+            try:
+                data_for_vdb = {
+                    compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
+                        "src_id": dp["src_id"],
+                        "tgt_id": dp["tgt_id"],
+                        "keywords": dp["keywords"],
+                        "content": f"{dp['src_id']}\t{dp['tgt_id']}\n{dp['keywords']}\n{dp['description']}",
+                        "source_id": dp["source_id"],
+                        "file_path": dp.get("file_path", "unknown_source"),
+                    }
+                    for dp in relationships_data
                 }
-                for dp in relationships_data
-            }
-            logger.info(f"开始向关系向量数据库插入 {len(data_for_vdb)} 条记录...")
-            await relationships_vdb.upsert(data_for_vdb)
-            logger.info("关系向量数据库更新完成")
+                logger.info(f"关系向量数据结构构建完成，共 {len(data_for_vdb)} 条记录")
+                logger.info(f"开始向关系向量数据库插入 {len(data_for_vdb)} 条记录...")
+                await relationships_vdb.upsert(data_for_vdb)
+                logger.info("关系向量数据库更新完成")
+            except Exception as e:
+                logger.error(f"更新关系向量数据库时发生错误: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise
+        else:
+            logger.info(f"跳过关系向量数据库更新 - relationships_vdb: {relationships_vdb is not None}, relationships_data: {len(relationships_data) if relationships_data else 0}")
 
     logger.info(f"合并操作全部完成！处理了 {len(entities_data)} 个实体和 {len(relationships_data)} 个关系")
+    logger.info("===== merge_nodes_and_edges函数执行完成 =====")
 
 
 async def extract_entities(
@@ -905,6 +966,21 @@ async def extract_entities(
 
     # Return the chunk_results for later processing in merge_nodes_and_edges
     logger.info(f"实体抽取阶段完成，处理了 {len(chunk_results)} 个块的结果")
+    logger.info("===== 详细分析实体抽取结果 =====")
+    
+    # 详细分析chunk_results的内容
+    total_entities = 0
+    total_relationships = 0
+    for i, (maybe_nodes, maybe_edges) in enumerate(chunk_results):
+        entities_count = sum(len(entities) for entities in maybe_nodes.values())
+        relationships_count = sum(len(edges) for edges in maybe_edges.values())
+        total_entities += entities_count
+        total_relationships += relationships_count
+        if i < 10:  # 只打印前10个块的详细信息，避免日志过多
+            logger.info(f"块 {i+1}: {entities_count} 个实体, {relationships_count} 个关系")
+    
+    logger.info(f"总计: {total_entities} 个实体, {total_relationships} 个关系")
+    logger.info("===== 开始返回chunk_results =====")
     return chunk_results
 
 

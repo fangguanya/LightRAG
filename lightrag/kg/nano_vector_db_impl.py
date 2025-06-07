@@ -84,12 +84,24 @@ class NanoVectorDBStorage(BaseVectorStorage):
         2. Only one process should updating the storage at a time before index_done_callback,
            KG-storage-log should be used to avoid data corruption
         """
-
-        logger.debug(f"Inserting {len(data)} to {self.namespace}")
+        import time
+        start_time = time.time()
+        
+        logger.info(f"===== NanoVectorDBStorage.upsert 开始 =====")
+        logger.info(f"命名空间: {self.namespace}")
+        logger.info(f"插入数据量: {len(data)} 条")
+        
         if not data:
+            logger.info("数据为空，跳过插入")
             return
 
+        # 分析数据内容
+        total_content_length = sum(len(v.get('content', '')) for v in data.values())
+        avg_content_length = total_content_length / len(data) if data else 0
+        logger.info(f"平均内容长度: {avg_content_length:.0f} 字符，总长度: {total_content_length:,} 字符")
+
         current_time = int(time.time())
+        logger.info(f"准备构建list_data...")
         list_data = [
             {
                 "__id__": k,
@@ -98,25 +110,194 @@ class NanoVectorDBStorage(BaseVectorStorage):
             }
             for k, v in data.items()
         ]
+        logger.info(f"list_data构建完成，包含 {len(list_data)} 条记录")
+        
+        logger.info(f"提取content字段...")
         contents = [v["content"] for v in data.values()]
+        logger.info(f"content提取完成，包含 {len(contents)} 个文本")
+        
+        logger.info(f"准备分批，批大小: {self._max_batch_size}")
         batches = [
             contents[i : i + self._max_batch_size]
             for i in range(0, len(contents), self._max_batch_size)
         ]
-
-        # Execute embedding outside of lock to avoid long lock times
-        embedding_tasks = [self.embedding_func(batch) for batch in batches]
-        embeddings_list = await asyncio.gather(*embedding_tasks)
-
+        logger.info(f"分批完成，共 {len(batches)} 个批次")
+        
+        # 详细监控每个批次的embedding计算
+        logger.info(f"开始执行embedding计算...")
+        embedding_start_time = time.time()
+        
+        # 添加重试机制和熔断机制的embedding计算
+        max_retries = 3
+        retry_delay = 2  # 秒
+        circuit_breaker_failures = 0  # 熔断器故障计数
+        max_circuit_failures = 2  # 最大连续失败次数
+        
+        for retry_attempt in range(max_retries + 1):
+            try:
+                if retry_attempt > 0:
+                    logger.info(f"embedding计算重试 {retry_attempt}/{max_retries}...")
+                    
+                    # 如果连续失败次数过多，增加延迟
+                    if circuit_breaker_failures >= max_circuit_failures:
+                        extended_delay = retry_delay * retry_attempt * 2
+                        logger.warning(f"检测到连续失败，启用熔断延迟: {extended_delay} 秒")
+                        await asyncio.sleep(extended_delay)
+                    else:
+                        await asyncio.sleep(retry_delay * retry_attempt)  # 递增延迟
+                
+                # Execute embedding outside of lock to avoid long lock times
+                embedding_tasks = []
+                for i, batch in enumerate(batches):
+                    logger.info(f"创建embedding任务 {i+1}/{len(batches)}，包含 {len(batch)} 个文本")
+                    
+                    # 为每个embedding任务添加单独的重试和超时
+                    async def embedding_task_with_retry(batch_content, task_id=i+1):
+                        task_max_retries = 2
+                        for task_retry in range(task_max_retries + 1):
+                            try:
+                                if task_retry > 0:
+                                    logger.warning(f"embedding任务 {task_id} 重试 {task_retry}/{task_max_retries}")
+                                    await asyncio.sleep(1)
+                                
+                                # 为单个embedding任务设置超时
+                                result = await asyncio.wait_for(
+                                    self.embedding_func(batch_content),
+                                    timeout=60  # 2分钟超时
+                                )
+                                logger.info(f"embedding任务 {task_id} 完成，返回 {len(result)} 个向量")
+                                return result
+                                
+                            except asyncio.TimeoutError as te:
+                                logger.error(f"embedding任务 {task_id} 超时 (尝试 {task_retry + 1}/{task_max_retries + 1})")
+                                if task_retry == task_max_retries:
+                                    logger.error(f"embedding任务 {task_id} 超时失败，已达最大重试次数")
+                                    raise
+                                continue
+                                
+                            except Exception as task_e:
+                                logger.error(f"embedding任务 {task_id} 异常 (尝试 {task_retry + 1}/{task_max_retries + 1}): {str(task_e)}")
+                                logger.error(f"embedding任务 {task_id} 异常类型: {type(task_e).__name__}")
+                                if task_retry == task_max_retries:
+                                    logger.error(f"embedding任务 {task_id} 异常失败，已达最大重试次数")
+                                    raise
+                                continue
+                        
+                        raise Exception(f"embedding任务 {task_id} 重试耗尽")
+                    
+                    task = embedding_task_with_retry(batch, i+1)
+                    embedding_tasks.append(task)
+                
+                logger.info(f"所有embedding任务已创建，开始并行执行...")
+                logger.info(f"等待 {len(embedding_tasks)} 个embedding任务完成...")
+                
+                # 设置总体超时，避免无限等待
+                total_embedding_timeout = 60  # 10分钟总超时
+                try:
+                    embeddings_list = await asyncio.wait_for(
+                        asyncio.gather(*embedding_tasks, return_exceptions=True),
+                        timeout=total_embedding_timeout
+                    )
+                    
+                    # 检查是否有任务返回异常
+                    failed_tasks = []
+                    successful_results = []
+                    for i, result in enumerate(embeddings_list):
+                        if isinstance(result, Exception):
+                            failed_tasks.append((i+1, result))
+                            logger.error(f"embedding任务 {i+1} 最终失败: {str(result)}")
+                        else:
+                            successful_results.append(result)
+                    
+                    if failed_tasks:
+                        raise Exception(f"有 {len(failed_tasks)} 个embedding任务失败: {[f'任务{task_id}' for task_id, _ in failed_tasks]}")
+                    
+                    embeddings_list = successful_results
+                    
+                except asyncio.TimeoutError:
+                    logger.error(f"embedding计算总体超时 ({total_embedding_timeout} 秒)")
+                    if retry_attempt < max_retries:
+                        logger.info(f"将在 {retry_delay * (retry_attempt + 1)} 秒后重试...")
+                        continue
+                    else:
+                        raise Exception(f"embedding计算总体超时，已达最大重试次数")
+                
+                embedding_elapsed = time.time() - embedding_start_time
+                logger.info(f"embedding计算完成，耗时: {embedding_elapsed:.1f} 秒")
+                logger.info(f"获得 {len(embeddings_list)} 个embedding批次结果")
+                
+                # 验证结果完整性
+                if len(embeddings_list) != len(batches):
+                    raise Exception(f"embedding结果数量不匹配: 期望 {len(batches)}, 实际 {len(embeddings_list)}")
+                
+                # 重置熔断器，因为成功了
+                circuit_breaker_failures = 0
+                logger.info("embedding计算成功，重置熔断器计数")
+                
+                break  # 成功完成，退出重试循环
+                
+            except Exception as e:
+                circuit_breaker_failures += 1
+                embedding_elapsed = time.time() - embedding_start_time
+                logger.error(f"embedding计算失败 (尝试 {retry_attempt + 1}/{max_retries + 1})，已运行: {embedding_elapsed:.1f} 秒")
+                logger.error(f"embedding错误: {str(e)}")
+                logger.error(f"错误类型: {type(e).__name__}")
+                logger.error(f"熔断器故障计数: {circuit_breaker_failures}")
+                
+                if retry_attempt < max_retries:
+                    next_delay = retry_delay * (retry_attempt + 1)
+                    if circuit_breaker_failures >= max_circuit_failures:
+                        next_delay *= 2  # 熔断延迟
+                        logger.warning(f"熔断器激活，将在 {next_delay} 秒后重试embedding计算...")
+                    else:
+                        logger.info(f"将在 {next_delay} 秒后重试embedding计算...")
+                    continue
+                else:
+                    logger.error("embedding计算已达最大重试次数，放弃处理")
+                    logger.error(f"最终熔断器状态: {circuit_breaker_failures} 次失败")
+                    
+                    # 提供降级策略建议
+                    if circuit_breaker_failures >= max_circuit_failures:
+                        logger.error("建议检查embedding服务状态或网络连接")
+                        logger.error("可能的解决方案: 1) 检查API密钥 2) 检查网络 3) 减少批处理大小")
+                    
+                    raise Exception(f"embedding计算彻底失败 (熔断器: {circuit_breaker_failures} 次失败): {str(e)}")
+        
+        # 如果到达这里说明重试成功了
+        logger.info("embedding计算重试成功！")
+        
+        logger.info(f"开始合并embedding结果...")
         embeddings = np.concatenate(embeddings_list)
+        logger.info(f"embedding合并完成，形状: {embeddings.shape}")
+        
         if len(embeddings) == len(list_data):
+            logger.info(f"embedding数量匹配，开始构建最终数据...")
             for i, d in enumerate(list_data):
                 d["__vector__"] = embeddings[i]
+            
+            logger.info(f"获取数据库客户端...")
             client = await self._get_client()
-            results = client.upsert(datas=list_data)
-            return results
+            
+            logger.info(f"开始执行数据库upsert操作...")
+            db_upsert_start = time.time()
+            try:
+                results = client.upsert(datas=list_data)
+                db_upsert_elapsed = time.time() - db_upsert_start
+                logger.info(f"数据库upsert完成，耗时: {db_upsert_elapsed:.1f} 秒")
+                
+                total_elapsed = time.time() - start_time
+                logger.info(f"===== NanoVectorDBStorage.upsert 完成，总耗时: {total_elapsed:.1f} 秒 =====")
+                return results
+            except Exception as e:
+                db_upsert_elapsed = time.time() - db_upsert_start
+                logger.error(f"数据库upsert失败，已运行: {db_upsert_elapsed:.1f} 秒")
+                logger.error(f"数据库错误: {str(e)}")
+                raise
         else:
             # sometimes the embedding is not returned correctly. just log it.
+            total_elapsed = time.time() - start_time
+            logger.error(f"embedding数量不匹配: {len(embeddings)} != {len(list_data)}")
+            logger.error(f"===== NanoVectorDBStorage.upsert 失败，总耗时: {total_elapsed:.1f} 秒 =====")
             logger.error(
                 f"embedding is not 1-1 with data, {len(embeddings)} != {len(list_data)}"
             )

@@ -961,7 +961,9 @@ class LightRAG:
 
                             # Process document (text chunks and full docs) in parallel
                             logger.info(f"开始并行处理文档 {doc_id}：文档状态更新、块向量化、实体关系抽取、原文存储")
-                            # Create tasks with references for potential cancellation
+                            
+                            logger.info("===== 创建并行任务 =====")
+                            logger.info("创建文档状态更新任务...")
                             doc_status_task = asyncio.create_task(
                                 self.doc_status.upsert(
                                     {
@@ -980,22 +982,210 @@ class LightRAG:
                                     }
                                 )
                             )
-                            chunks_vdb_task = asyncio.create_task(
-                                self.chunks_vdb.upsert(chunks)
-                            )
+                            logger.info("文档状态更新任务创建完成")
+                            
+                            logger.info(f"创建块向量化任务，处理 {len(chunks)} 个文本块...")
+                            # 为chunks_vdb_task添加特殊的监控包装
+                            async def chunks_vdb_task_with_monitoring():
+                                logger.info(f"===== 开始执行chunks_vdb.upsert =====")
+                                logger.info(f"待处理的文本块数量: {len(chunks)}")
+                                logger.info(f"当前embedding_batch_num配置: {getattr(self, 'embedding_batch_num', '未设置')}")
+                                
+                                # 检查数据大小
+                                total_content_length = sum(len(chunk.get('content', '')) for chunk in chunks.values())
+                                avg_content_length = total_content_length / len(chunks) if chunks else 0
+                                logger.info(f"文本内容统计 - 总长度: {total_content_length:,} 字符, 平均长度: {avg_content_length:.0f} 字符")
+                                
+                                import time
+                                start_time = time.time()
+                                
+                                try:
+                                    # 分批处理优化
+                                    if len(chunks) > 1000:  # 如果超过1000个块，分批处理
+                                        logger.info("数据量较大，启用分批处理模式...")
+                                        batch_size = 500
+                                        chunk_items = list(chunks.items())
+                                        
+                                        for i in range(0, len(chunk_items), batch_size):
+                                            batch_chunks = dict(chunk_items[i:i + batch_size])
+                                            batch_num = i // batch_size + 1
+                                            total_batches = (len(chunk_items) + batch_size - 1) // batch_size
+                                            
+                                            logger.info(f"处理批次 {batch_num}/{total_batches}，包含 {len(batch_chunks)} 个文本块...")
+                                            
+                                            try:
+                                                memory_before = process.memory_info().rss / 1024 / 1024  # MB
+                                            except:
+                                                memory_before = 0
+                                            logger.info(f"批次 {batch_num} 开始前内存使用: {memory_before:.1f} MB")
+                                            
+                                            batch_start_time = time.time()
+                                            
+                                            # 详细监控批次内部处理过程
+                                            logger.info(f"批次 {batch_num}: 开始调用 chunks_vdb.upsert...")
+                                            logger.info(f"批次 {batch_num}: 数据详情 - 包含 {len(batch_chunks)} 个块")
+                                            
+                                            # 分析批次数据内容
+                                            total_content_length = sum(len(chunk.get('content', '')) for chunk in batch_chunks.values())
+                                            avg_content_length = total_content_length / len(batch_chunks) if batch_chunks else 0
+                                            logger.info(f"批次 {batch_num}: 平均文本长度 {avg_content_length:.0f} 字符，总长度 {total_content_length:,} 字符")
+                                            
+                                            # 检查是否有特殊的长文本
+                                            long_chunks = [(k, len(v.get('content', ''))) for k, v in batch_chunks.items() if len(v.get('content', '')) > 5000]
+                                            if long_chunks:
+                                                logger.info(f"批次 {batch_num}: 发现 {len(long_chunks)} 个长文本块 (>5000字符)")
+                                                for chunk_id, length in long_chunks[:3]:  # 只显示前3个
+                                                    logger.info(f"  长文本块 {chunk_id}: {length} 字符")
+                                            
+                                            # 添加超时机制的upsert调用
+                                            upsert_timeout = 60  # 5分钟超时
+                                            logger.info(f"批次 {batch_num}: 开始执行upsert操作，超时设置: {upsert_timeout} 秒...")
+                                            
+                                            try:
+                                                await asyncio.wait_for(
+                                                    self.chunks_vdb.upsert(batch_chunks),
+                                                    timeout=upsert_timeout
+                                                )
+                                                logger.info(f"批次 {batch_num}: upsert操作成功完成")
+                                            except asyncio.TimeoutError:
+                                                logger.error(f"批次 {batch_num}: upsert操作超时 ({upsert_timeout} 秒)")
+                                                
+                                                # 对于超时的批次，尝试分解为更小的子批次
+                                                if len(batch_chunks) > 50:
+                                                    logger.info(f"批次 {batch_num}: 尝试分解为更小的子批次处理...")
+                                                    sub_batch_size = 50
+                                                    batch_items = list(batch_chunks.items())
+                                                    success_count = 0
+                                                    
+                                                    for j in range(0, len(batch_items), sub_batch_size):
+                                                        sub_batch = dict(batch_items[j:j + sub_batch_size])
+                                                        sub_batch_num = j // sub_batch_size + 1
+                                                        total_sub_batches = (len(batch_items) + sub_batch_size - 1) // sub_batch_size
+                                                        
+                                                        try:
+                                                            logger.info(f"批次 {batch_num}-子批次 {sub_batch_num}/{total_sub_batches}: 处理 {len(sub_batch)} 个块...")
+                                                            await asyncio.wait_for(
+                                                                self.chunks_vdb.upsert(sub_batch),
+                                                                timeout=60  # 1分钟子批次超时
+                                                            )
+                                                            success_count += len(sub_batch)
+                                                            logger.info(f"批次 {batch_num}-子批次 {sub_batch_num}: 成功")
+                                                        except Exception as sub_e:
+                                                            logger.error(f"批次 {batch_num}-子批次 {sub_batch_num}: 失败 - {str(sub_e)}")
+                                                            continue  # 跳过失败的子批次，继续处理下一个
+                                                    
+                                                    logger.info(f"批次 {batch_num}: 分解处理完成，成功处理 {success_count}/{len(batch_chunks)} 个块")
+                                                    if success_count == 0:
+                                                        logger.error(f"批次 {batch_num}: 所有子批次都失败，跳过此批次")
+                                                        continue  # 跳过整个批次
+                                                else:
+                                                    logger.error(f"批次 {batch_num}: 批次太小无法分解，跳过此批次")
+                                                    continue  # 跳过此批次
+                                                    
+                                            except Exception as upsert_error:
+                                                logger.error(f"批次 {batch_num}: upsert操作异常: {str(upsert_error)}")
+                                                logger.error(f"批次 {batch_num}: 异常类型: {type(upsert_error).__name__}")
+                                                logger.error(f"批次 {batch_num}: 尝试跳过此批次继续处理...")
+                                                continue  # 跳过失败的批次，继续处理下一个
+                                            
+                                            batch_elapsed = time.time() - batch_start_time
+                                            
+                                            try:
+                                                memory_after = process.memory_info().rss / 1024 / 1024  # MB
+                                                logger.info(f"批次 {batch_num} 完成，耗时: {batch_elapsed:.1f} 秒，内存使用: {memory_after:.1f} MB (+{memory_after-memory_before:.1f} MB)")
+                                            except:
+                                                logger.info(f"批次 {batch_num} 完成，耗时: {batch_elapsed:.1f} 秒")
+                                            
+                                            # 强制垃圾回收
+                                            import gc
+                                            gc.collect()
+                                            
+                                            # 给系统一些时间
+                                            await asyncio.sleep(0.1)
+                                    else:
+                                        # 正常处理
+                                        logger.info("正常处理模式...")
+                                        await self.chunks_vdb.upsert(chunks)
+                                    
+                                    elapsed_time = time.time() - start_time
+                                    logger.info(f"===== chunks_vdb.upsert 执行完成，总耗时: {elapsed_time:.1f} 秒 =====")
+                                    
+                                except Exception as e:
+                                    elapsed_time = time.time() - start_time
+                                    logger.error(f"chunks_vdb.upsert 执行失败，已运行: {elapsed_time:.1f} 秒")
+                                    logger.error(f"错误详情: {str(e)}")
+                                    logger.error(traceback.format_exc())
+                                    
+                                    # 检查是否是embedding相关的错误
+                                    error_msg = str(e).lower()
+                                    if any(keyword in error_msg for keyword in ['embedding', 'timeout', 'connection', 'network']):
+                                        logger.error("检测到embedding或网络相关错误，尝试降级处理...")
+                                        
+                                        # 尝试更保守的处理方式
+                                        try:
+                                            logger.info("尝试使用更小的批次重新处理...")
+                                            conservative_batch_size = 100
+                                            chunk_items = list(chunks.items())
+                                            successful_chunks = 0
+                                            
+                                            for i in range(0, len(chunk_items), conservative_batch_size):
+                                                conservative_batch = dict(chunk_items[i:i + conservative_batch_size])
+                                                batch_num = i // conservative_batch_size + 1
+                                                total_conservative_batches = (len(chunk_items) + conservative_batch_size - 1) // conservative_batch_size
+                                                
+                                                try:
+                                                    logger.info(f"保守处理批次 {batch_num}/{total_conservative_batches}: {len(conservative_batch)} 个块")
+                                                    await self.chunks_vdb.upsert(conservative_batch)
+                                                    successful_chunks += len(conservative_batch)
+                                                    logger.info(f"保守处理批次 {batch_num}: 成功")
+                                                    
+                                                    # 每个保守批次后休息一下
+                                                    await asyncio.sleep(1)
+                                                    
+                                                except Exception as conservative_e:
+                                                    logger.error(f"保守处理批次 {batch_num} 失败: {str(conservative_e)}")
+                                                    continue
+                                            
+                                            if successful_chunks > 0:
+                                                logger.info(f"保守处理完成，成功处理 {successful_chunks}/{len(chunks)} 个块")
+                                                logger.info("虽然有部分失败，但继续执行后续流程...")
+                                            else:
+                                                logger.error("保守处理也完全失败，但仍继续执行后续流程以避免整体中断...")
+                                                
+                                        except Exception as conservative_error:
+                                            logger.error(f"保守处理也失败: {str(conservative_error)}")
+                                            logger.error("将继续执行后续流程，尽量保持系统稳定...")
+                                    else:
+                                        logger.error("非embedding错误，继续执行后续流程...")
+                                    
+                                    # 不再抛出异常，而是继续执行
+                                    logger.info("尽管chunks_vdb处理有问题，但继续执行后续流程以保持系统稳定性...")
+                            
+                            chunks_vdb_task = asyncio.create_task(chunks_vdb_task_with_monitoring())
+                            logger.info("块向量化任务创建完成")
+                            
+                            logger.info(f"创建实体关系抽取任务，处理 {len(chunks)} 个文本块...")
                             entity_relation_task = asyncio.create_task(
                                 self._process_entity_relation_graph(
                                     chunks, pipeline_status, pipeline_status_lock
                                 )
                             )
+                            logger.info("实体关系抽取任务创建完成")
+                            
+                            logger.info("创建原文存储任务...")
                             full_docs_task = asyncio.create_task(
                                 self.full_docs.upsert(
                                     {doc_id: {"content": status_doc.content}}
                                 )
                             )
+                            logger.info("原文存储任务创建完成")
+                            
+                            logger.info(f"创建文本块存储任务，处理 {len(chunks)} 个文本块...")
                             text_chunks_task = asyncio.create_task(
                                 self.text_chunks.upsert(chunks)
                             )
+                            logger.info("文本块存储任务创建完成")
+                            
                             tasks = [
                                 doc_status_task,
                                 chunks_vdb_task,
@@ -1004,7 +1194,96 @@ class LightRAG:
                                 text_chunks_task,
                             ]
                             logger.info(f"启动文档 {doc_id} 的 {len(tasks)} 个并行处理任务")
-                            await asyncio.gather(*tasks)
+                            
+                            # 监控每个任务的状态
+                            task_names = [
+                                "doc_status_task", 
+                                "chunks_vdb_task", 
+                                "entity_relation_task", 
+                                "full_docs_task", 
+                                "text_chunks_task"
+                            ]
+                            
+                            logger.info("===== 并行任务状态监控 =====")
+                            for i, (task, name) in enumerate(zip(tasks, task_names)):
+                                logger.info(f"任务 {i+1} ({name}): 完成状态 = {task.done()}")
+                            
+                            logger.info("准备执行 asyncio.gather(*tasks)...")
+                            try:
+                                # 使用asyncio.wait代替gather来更好地监控任务状态
+                                import time
+                                start_time = time.time()
+                                timeout_duration = 3600  # 1小时超时
+                                
+                                logger.info(f"开始等待所有任务完成，超时时间: {timeout_duration} 秒...")
+                                
+                                # 每30秒检查一次任务状态
+                                check_interval = 30
+                                while True:
+                                    done, pending = await asyncio.wait(tasks, timeout=check_interval, return_when=asyncio.FIRST_COMPLETED)
+                                    
+                                    elapsed_time = time.time() - start_time
+                                    #logger.info(f"===== 任务进度检查 (已运行 {elapsed_time:.1f} 秒) =====")
+                                    
+                                    # 检查每个任务的状态
+                                    all_tasks_done = True
+                                    for i, (task, name) in enumerate(zip(tasks, task_names)):
+                                        status = "已完成" if task.done() else "运行中"
+                                        if task.done() and task.exception():
+                                            status = f"异常: {task.exception()}"
+                                        #logger.info(f"任务 {i+1} ({name}): {status}")
+                                        
+                                        # 如果任务未完成，标记all_tasks_done为False
+                                        if not task.done():
+                                            all_tasks_done = False
+                                    
+                                    # 检查是否所有任务都完成了 - 使用我们的计数器而不是all()函数
+                                    if all_tasks_done:
+                                        logger.info("检测到所有任务已完成！准备退出监控循环...")
+                                        break
+                                    
+                                    # 检查是否超时
+                                    if elapsed_time > timeout_duration:
+                                        logger.error(f"任务执行超时 ({timeout_duration} 秒)，取消未完成的任务...")
+                                        for task in tasks:
+                                            if not task.done():
+                                                task.cancel()
+                                        raise asyncio.TimeoutError(f"任务执行超时 ({timeout_duration} 秒)")
+                                    
+                                    # 如果有任务异常，立即处理
+                                    for task in done:
+                                        if task.exception():
+                                            logger.error(f"任务异常: {task.exception()}")
+                                            # 取消其他任务
+                                            for other_task in tasks:
+                                                if not other_task.done():
+                                                    other_task.cancel()
+                                            raise task.exception()
+                                
+                                logger.info("任务监控循环已退出，准备获取所有任务结果...")
+                                # 获取所有任务的结果
+                                results = []
+                                for i, task in enumerate(tasks):
+                                    try:
+                                        result = task.result()
+                                        results.append(result)
+                                        logger.info(f"任务 {i+1} ({task_names[i]}) 结果获取成功")
+                                    except Exception as e:
+                                        logger.error(f"任务 {i+1} ({task_names[i]}) 结果获取失败: {e}")
+                                        raise
+                                
+                                logger.info(f"所有任务成功完成，总耗时: {time.time() - start_time:.1f} 秒")
+                                
+                            except Exception as e:
+                                logger.error(f"并行任务执行出现异常: {str(e)}")
+                                logger.error(traceback.format_exc())
+                                raise
+                            
+                            logger.info("asyncio.gather(*tasks) 执行完成")
+                            logger.info("===== 检查所有任务最终状态 =====")
+                            for i, (task, name) in enumerate(zip(tasks, task_names)):
+                                logger.info(f"任务 {i+1} ({name}): 完成状态 = {task.done()}, 异常 = {task.exception() if task.done() else 'N/A'}")
+                            
                             logger.info(f"文档 {doc_id} 的所有并行任务完成")
                             file_extraction_stage_ok = True
 
@@ -1019,16 +1298,6 @@ class LightRAG:
                                     traceback.format_exc()
                                 )
                                 pipeline_status["history_messages"].append(error_msg)
-
-                                # Cancel other tasks as they are no longer meaningful
-                                for task in [
-                                    chunks_vdb_task,
-                                    entity_relation_task,
-                                    full_docs_task,
-                                    text_chunks_task,
-                                ]:
-                                    if not task.done():
-                                        task.cancel()
 
                             # Persistent llm cache
                             if self.llm_response_cache:
@@ -1058,22 +1327,44 @@ class LightRAG:
                         try:
                             logger.info(f"文档 {doc_id} 开始进入合并阶段...")
                             # Get chunk_results from entity_relation_task
+                            logger.info(f"文档 {doc_id} 准备等待实体抽取任务完成...")
+                            logger.info(f"实体抽取任务状态: {entity_relation_task}")
+                            logger.info(f"实体抽取任务是否完成: {entity_relation_task.done()}")
+                            
                             chunk_results = await entity_relation_task
+                            logger.info(f"文档 {doc_id} 成功获取到实体抽取结果")
                             logger.info(f"文档 {doc_id} 实体抽取完成，开始合并节点和边...")
-                            await merge_nodes_and_edges(
-                                chunk_results=chunk_results,  # result collected from entity_relation_task
-                                knowledge_graph_inst=self.chunk_entity_relation_graph,
-                                entity_vdb=self.entities_vdb,
-                                relationships_vdb=self.relationships_vdb,
-                                global_config=asdict(self),
-                                pipeline_status=pipeline_status,
-                                pipeline_status_lock=pipeline_status_lock,
-                                llm_response_cache=self.llm_response_cache,
-                                current_file_number=current_file_number,
-                                total_files=total_files,
-                                file_path=file_path,
-                            )
-                            logger.info(f"文档 {doc_id} 节点和边合并完成")
+                            logger.info(f"准备合并 {len(chunk_results)} 个块的实体关系结果...")
+                            
+                            # 分析chunk_results内容
+                            logger.info("===== 分析chunk_results详细内容 =====")
+                            if isinstance(chunk_results, list):
+                                logger.info(f"chunk_results是列表，长度: {len(chunk_results)}")
+                                for i, item in enumerate(chunk_results[:5]):  # 只显示前5个
+                                    logger.info(f"chunk_results[{i}] 类型: {type(item)}, 内容长度: {len(str(item))}")
+                            else:
+                                logger.info(f"chunk_results类型: {type(chunk_results)}")
+                            logger.info("===== 开始调用merge_nodes_and_edges =====")
+                            
+                            try:
+                                await merge_nodes_and_edges(
+                                    chunk_results=chunk_results,  # result collected from entity_relation_task
+                                    knowledge_graph_inst=self.chunk_entity_relation_graph,
+                                    entity_vdb=self.entities_vdb,
+                                    relationships_vdb=self.relationships_vdb,
+                                    global_config=asdict(self),
+                                    pipeline_status=pipeline_status,
+                                    pipeline_status_lock=pipeline_status_lock,
+                                    llm_response_cache=self.llm_response_cache,
+                                    current_file_number=current_file_number,
+                                    total_files=total_files,
+                                    file_path=file_path,
+                                )
+                                logger.info(f"文档 {doc_id} 节点和边合并完成")
+                            except Exception as merge_error:
+                                logger.error(f"合并节点和边时发生错误: {str(merge_error)}")
+                                logger.error(traceback.format_exc())
+                                raise merge_error
 
                             await self.doc_status.upsert(
                                 {
@@ -1191,42 +1482,75 @@ class LightRAG:
                 pipeline_status["history_messages"].append(log_message)
 
     async def _process_entity_relation_graph(
-        self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
+        self, chunks: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
     ) -> list:
+        logger.info("===== 开始执行_process_entity_relation_graph函数 =====")
+        logger.info(f"输入参数检查 - chunks类型: {type(chunks)}, 数量: {len(chunks)}")
         try:
+            logger.info(f"开始处理 {len(chunks)} 个文本块的实体关系抽取...")
+            logger.info("准备调用extract_entities函数...")
+            
             chunk_results = await extract_entities(
-                chunk,
+                chunks,
                 global_config=asdict(self),
                 pipeline_status=pipeline_status,
                 pipeline_status_lock=pipeline_status_lock,
                 llm_response_cache=self.llm_response_cache,
             )
+            
+            logger.info(f"extract_entities函数执行完成")
+            logger.info(f"实体关系抽取完成，返回 {len(chunk_results)} 个块的结果")
+            logger.info(f"返回结果类型: {type(chunk_results)}")
+            logger.info("===== _process_entity_relation_graph函数执行完成 =====")
             return chunk_results
         except Exception as e:
             error_msg = f"Failed to extract entities and relationships: {str(e)}"
             logger.error(error_msg)
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = error_msg
-                pipeline_status["history_messages"].append(error_msg)
+            logger.error(f"错误详情: {traceback.format_exc()}")
+            if pipeline_status_lock:
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = error_msg
+                    pipeline_status["history_messages"].append(error_msg)
             raise e
 
     async def _insert_done(
         self, pipeline_status=None, pipeline_status_lock=None
     ) -> None:
+        logger.info("===== 开始执行_insert_done函数 =====")
+        logger.info("准备收集存储实例列表...")
+        
+        storage_instances = [  # type: ignore
+            self.full_docs,
+            self.text_chunks,
+            self.llm_response_cache,
+            self.entities_vdb,
+            self.relationships_vdb,
+            self.chunks_vdb,
+            self.chunk_entity_relation_graph,
+        ]
+        
+        # 检查每个存储实例
+        logger.info("检查存储实例状态:")
+        for i, storage_inst in enumerate(storage_instances):
+            if storage_inst is not None:
+                logger.info(f"  存储实例 {i}: {type(storage_inst).__name__} - 有效")
+            else:
+                logger.info(f"  存储实例 {i}: None - 跳过")
+        
         tasks = [
             cast(StorageNameSpace, storage_inst).index_done_callback()
-            for storage_inst in [  # type: ignore
-                self.full_docs,
-                self.text_chunks,
-                self.llm_response_cache,
-                self.entities_vdb,
-                self.relationships_vdb,
-                self.chunks_vdb,
-                self.chunk_entity_relation_graph,
-            ]
+            for storage_inst in storage_instances
             if storage_inst is not None
         ]
-        await asyncio.gather(*tasks)
+        
+        logger.info(f"准备执行 {len(tasks)} 个index_done_callback任务...")
+        try:
+            await asyncio.gather(*tasks)
+            logger.info("所有index_done_callback任务执行完成")
+        except Exception as e:
+            logger.error(f"执行index_done_callback任务时发生错误: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
         log_message = "In memory DB persist to disk"
         logger.info(log_message)
@@ -1235,6 +1559,8 @@ class LightRAG:
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
+        
+        logger.info("===== _insert_done函数执行完成 =====")
 
     def insert_custom_kg(
         self, custom_kg: dict[str, Any], full_doc_id: str = None

@@ -315,281 +315,214 @@ class QueueFullError(Exception):
 
 def priority_limit_async_func_call(max_size: int, max_queue_size: int = 1000):
     """
-    Enhanced priority-limited asynchronous function call decorator
+    简化的异步函数调用装饰器，逐个执行任务，带进度跟踪和时间预估
 
     Args:
-        max_size: Maximum number of concurrent calls
-        max_queue_size: Maximum queue capacity to prevent memory overflow
+        max_size: 最大并发数量（当前版本暂不使用，保留接口）
+        max_queue_size: 最大队列容量（当前版本暂不使用，保留接口）
     Returns:
-        Decorator function
+        装饰器函数
     """
 
     def final_decro(func):
-        # Ensure func is callable
+        # 确保func是可调用的
         if not callable(func):
-            raise TypeError(f"Expected a callable object, got {type(func)}")
-        queue = asyncio.PriorityQueue(maxsize=max_queue_size)
-        tasks = set()
-        initialization_lock = asyncio.Lock()
-        counter = 0
-        shutdown_event = asyncio.Event()
-        initialized = False  # Global initialization flag
-        worker_health_check_task = None
-
-        # Track active future objects for cleanup
-        active_futures = weakref.WeakSet()
-        reinit_count = 0  # Reinitialization counter to track system health
-
-        # Worker function to process tasks in the queue
-        async def worker():
-            """Worker that processes tasks in the priority queue"""
-            try:
-                while not shutdown_event.is_set():
-                    try:
-                        # Use timeout to get tasks, allowing periodic checking of shutdown signal
-                        try:
-                            (
-                                priority,
-                                count,
-                                future,
-                                args,
-                                kwargs,
-                            ) = await asyncio.wait_for(queue.get(), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            # Timeout is just to check shutdown signal, continue to next iteration
-                            continue
-
-                        # If future is cancelled, skip execution
-                        if future.cancelled():
-                            queue.task_done()
-                            continue
-
-                        try:
-                            # Execute function
-                            result = await func(*args, **kwargs)
-                            # If future is not done, set the result
-                            if not future.done():
-                                future.set_result(result)
-                        except asyncio.CancelledError:
-                            if not future.done():
-                                future.cancel()
-                            logger.debug("limit_async: Task cancelled during execution")
-                        except Exception as e:
-                            logger.error(
-                                f"limit_async: Error in decorated function: {str(e)}"
-                            )
-                            if not future.done():
-                                future.set_exception(e)
-                        finally:
-                            queue.task_done()
-                    except Exception as e:
-                        # Catch all exceptions in worker loop to prevent worker termination
-                        logger.error(f"limit_async: Critical error in worker: {str(e)}")
-                        await asyncio.sleep(0.1)  # Prevent high CPU usage
-            finally:
-                logger.debug("limit_async: Worker exiting")
-
-        async def health_check():
-            """Periodically check worker health status and recover"""
-            nonlocal initialized
-            try:
-                while not shutdown_event.is_set():
-                    await asyncio.sleep(5)  # Check every 5 seconds
-
-                    # No longer acquire lock, directly operate on task set
-                    # Use a copy of the task set to avoid concurrent modification
-                    current_tasks = set(tasks)
-                    done_tasks = {t for t in current_tasks if t.done()}
-                    tasks.difference_update(done_tasks)
-
-                    # Calculate active tasks count
-                    active_tasks_count = len(tasks)
-                    workers_needed = max_size - active_tasks_count
-
-                    if workers_needed > 0:
-                        logger.info(
-                            f"limit_async: Creating {workers_needed} new workers"
-                        )
-                        new_tasks = set()
-                        for _ in range(workers_needed):
-                            task = asyncio.create_task(worker())
-                            new_tasks.add(task)
-                            task.add_done_callback(tasks.discard)
-                        # Update task set in one operation
-                        tasks.update(new_tasks)
-            except Exception as e:
-                logger.error(f"limit_async: Error in health check: {str(e)}")
-            finally:
-                logger.debug("limit_async: Health check task exiting")
-                initialized = False
-
-        async def ensure_workers():
-            """Ensure worker threads and health check system are available
-
-            This function checks if the worker system is already initialized.
-            If not, it performs a one-time initialization of all worker threads
-            and starts the health check system.
-            """
-            nonlocal initialized, worker_health_check_task, tasks, reinit_count
-
-            if initialized:
-                return
-
-            async with initialization_lock:
-                if initialized:
-                    return
-
-                # Increment reinitialization counter if this is not the first initialization
-                if reinit_count > 0:
-                    reinit_count += 1
-                    logger.warning(
-                        f"limit_async: Reinitializing needed (count: {reinit_count})"
-                    )
-                else:
-                    reinit_count = 1  # First initialization
-
-                # Check for completed tasks and remove them from the task set
-                current_tasks = set(tasks)
-                done_tasks = {t for t in current_tasks if t.done()}
-                tasks.difference_update(done_tasks)
-
-                # Log active tasks count during reinitialization
-                active_tasks_count = len(tasks)
-                if active_tasks_count > 0 and reinit_count > 1:
-                    logger.warning(
-                        f"limit_async: {active_tasks_count} tasks still running during reinitialization"
-                    )
-
-                # Create initial worker tasks, only adding the number needed
-                workers_needed = max_size - active_tasks_count
-                for _ in range(workers_needed):
-                    task = asyncio.create_task(worker())
-                    tasks.add(task)
-                    task.add_done_callback(tasks.discard)
-
-                # Start health check
-                worker_health_check_task = asyncio.create_task(health_check())
-
-                initialized = True
-                logger.info(f"limit_async: {workers_needed} new workers initialized")
-
-        async def shutdown():
-            """Gracefully shut down all workers and the queue"""
-            logger.info("limit_async: Shutting down priority queue workers")
-
-            # Set the shutdown event
-            shutdown_event.set()
-
-            # Cancel all active futures
-            for future in list(active_futures):
-                if not future.done():
-                    future.cancel()
-
-            # Wait for the queue to empty
-            try:
-                await asyncio.wait_for(queue.join(), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "limit_async: Timeout waiting for queue to empty during shutdown"
-                )
-
-            # Cancel all worker tasks
-            for task in list(tasks):
-                if not task.done():
-                    task.cancel()
-
-            # Wait for all tasks to complete
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Cancel the health check task
-            if worker_health_check_task and not worker_health_check_task.done():
-                worker_health_check_task.cancel()
-                try:
-                    await worker_health_check_task
-                except asyncio.CancelledError:
-                    pass
-
-            logger.info("limit_async: Priority queue workers shutdown complete")
-
+            raise TypeError(f"期望一个可调用对象，得到 {type(func)}")
+        
+        # 任务跟踪统计
+        counter = 0  # 任务序号计数器
+        completed_tasks = 0  # 已完成任务数量
+        total_tasks = 0  # 总任务数量（动态更新）
+        execution_times = []  # 任务执行时间历史记录（用于预估）
+        max_history_size = 10  # 保留最近N个任务的执行时间用于预估
+        execution_lock = asyncio.Lock()  # 用于顺序执行
+        stats_lock = asyncio.Lock()  # 用于统计数据的线程安全
+        
+        def get_average_execution_time():
+            """计算平均执行时间"""
+            if not execution_times:
+                return 0.0
+            return sum(execution_times) / len(execution_times)
+        
+        def estimate_remaining_time():
+            """预估剩余时间"""
+            avg_time = get_average_execution_time()
+            if avg_time <= 0:
+                return "无法预估"
+            
+            remaining_tasks = total_tasks - completed_tasks
+            if remaining_tasks <= 0:
+                return "即将完成"
+            
+            remaining_seconds = remaining_tasks * avg_time
+            
+            # 格式化时间显示
+            if remaining_seconds < 60:
+                return f"{remaining_seconds:.1f}秒"
+            elif remaining_seconds < 3600:
+                minutes = remaining_seconds / 60
+                return f"{minutes:.1f}分钟"
+            else:
+                hours = remaining_seconds / 3600
+                return f"{hours:.1f}小时"
+        
+        def get_progress_info():
+            """获取进度信息"""
+            if total_tasks <= 0:
+                progress_percent = 0.0
+            else:
+                progress_percent = (completed_tasks / total_tasks) * 100
+            
+            return {
+                "completed": completed_tasks,
+                "total": total_tasks,
+                "progress_percent": progress_percent,
+                "avg_execution_time": get_average_execution_time(),
+                "estimated_remaining": estimate_remaining_time()
+            }
+        
         @wraps(func)
         async def wait_func(
             *args, _priority=10, _timeout=None, _queue_timeout=None, **kwargs
         ):
             """
-            Execute the function with priority-based concurrency control
+            逐个执行函数调用
             Args:
-                *args: Positional arguments passed to the function
-                _priority: Call priority (lower values have higher priority)
-                _timeout: Maximum time to wait for function completion (in seconds)
-                _queue_timeout: Maximum time to wait for entering the queue (in seconds)
-                **kwargs: Keyword arguments passed to the function
+                *args: 传递给函数的位置参数
+                _priority: 调用优先级（当前版本暂不使用，保留接口）
+                _timeout: 函数执行的最大等待时间（秒）
+                _queue_timeout: 队列等待超时（当前版本暂不使用，保留接口）
+                **kwargs: 传递给函数的关键字参数
             Returns:
-                The result of the function call
+                函数调用的结果
             Raises:
-                TimeoutError: If the function call times out
-                QueueFullError: If the queue is full and waiting times out
-                Any exception raised by the decorated function
+                TimeoutError: 如果函数调用超时
+                函数本身抛出的任何异常
             """
-            # Ensure worker system is initialized
-            await ensure_workers()
-
-            # Create a future for the result
-            future = asyncio.Future()
-            active_futures.add(future)
-
-            nonlocal counter
-            async with initialization_lock:
-                current_count = counter  # Use local variable to avoid race conditions
+            import time
+            start_time = time.time()
+            
+            # 获取任务编号并更新统计
+            nonlocal counter, total_tasks, completed_tasks
+            async with stats_lock:
+                current_count = counter
                 counter += 1
+                total_tasks = counter  # 动态更新总任务数
+            
+            # 获取当前进度信息
+            progress = get_progress_info()
+            
+            logger.info(f"===== 简化版 priority_limit_async_func_call 开始 =====")
+            logger.info(f"函数: {func.__name__ if hasattr(func, '__name__') else 'anonymous'}")
+            logger.info(f"任务编号: {current_count} | 进度: {progress['completed']}/{progress['total']} ({progress['progress_percent']:.1f}%)")
+            logger.info(f"参数数量: {len(args)} 个位置参数, {len(kwargs)} 个关键字参数")
+            logger.info(f"超时设置: {_timeout} 秒")
+            if progress['avg_execution_time'] > 0:
+                logger.info(f"平均执行时间: {progress['avg_execution_time']:.2f}秒 | 预估剩余时间: {progress['estimated_remaining']}")
+            
+            # 使用锁确保任务逐个执行
+            async with execution_lock:
+                try:
+                    logger.info(f"开始执行任务 {current_count}...")
+                    exec_start = time.time()
+                    
+                    if _timeout is not None:
+                        logger.info(f"使用执行超时: {_timeout} 秒")
+                        try:
+                            result = await asyncio.wait_for(
+                                func(*args, **kwargs), 
+                                timeout=_timeout
+                            )
+                            exec_elapsed = time.time() - exec_start
+                            total_elapsed = time.time() - start_time
+                            
+                            # 更新执行时间统计
+                            async with stats_lock:
+                                completed_tasks += 1
+                                execution_times.append(exec_elapsed)
+                                # 保持历史记录大小
+                                if len(execution_times) > max_history_size:
+                                    execution_times.pop(0)
+                            
+                            # 获取更新后的进度信息
+                            final_progress = get_progress_info()
+                            
+                            logger.info(f"任务 {current_count} 执行成功! 执行耗时: {exec_elapsed:.2f}秒, 总耗时: {total_elapsed:.2f}秒")
+                            logger.info(f"总体进度: {final_progress['completed']}/{final_progress['total']} ({final_progress['progress_percent']:.1f}%) | 预估剩余: {final_progress['estimated_remaining']}")
+                            logger.info(f"===== 简化版 priority_limit_async_func_call 完成 =====")
+                            return result
+                        except asyncio.TimeoutError:
+                            exec_elapsed = time.time() - exec_start
+                            total_elapsed = time.time() - start_time
+                            
+                            # 超时也算完成（虽然失败了）
+                            async with stats_lock:
+                                completed_tasks += 1
+                                
+                            logger.error(f"任务 {current_count} 执行超时! 执行耗时: {exec_elapsed:.2f}秒, 总耗时: {total_elapsed:.2f}秒")
+                            raise TimeoutError(f"任务执行超时: {_timeout} 秒")
+                    else:
+                        logger.info("使用无限制执行等待...")
+                        result = await func(*args, **kwargs)
+                        exec_elapsed = time.time() - exec_start
+                        total_elapsed = time.time() - start_time
+                        
+                        # 更新执行时间统计
+                        async with stats_lock:
+                            completed_tasks += 1
+                            execution_times.append(exec_elapsed)
+                            # 保持历史记录大小
+                            if len(execution_times) > max_history_size:
+                                execution_times.pop(0)
+                        
+                        # 获取更新后的进度信息
+                        final_progress = get_progress_info()
+                        
+                        logger.info(f"任务 {current_count} 执行成功! 执行耗时: {exec_elapsed:.2f}秒, 总耗时: {total_elapsed:.2f}秒")
+                        logger.info(f"总体进度: {final_progress['completed']}/{final_progress['total']} ({final_progress['progress_percent']:.1f}%) | 预估剩余: {final_progress['estimated_remaining']}")
+                        logger.info(f"===== 简化版 priority_limit_async_func_call 完成 =====")
+                        return result
+                        
+                except Exception as e:
+                    exec_elapsed = time.time() - exec_start
+                    total_elapsed = time.time() - start_time
+                    
+                    # 失败也算完成（用于进度统计）
+                    async with stats_lock:
+                        completed_tasks += 1
+                    
+                    # 获取更新后的进度信息
+                    final_progress = get_progress_info()
+                    
+                    logger.error(f"任务 {current_count} 执行失败! 执行耗时: {exec_elapsed:.2f}秒, 总耗时: {total_elapsed:.2f}秒")
+                    logger.error(f"执行错误: {str(e)}")
+                    logger.error(f"错误类型: {type(e).__name__}")
+                    logger.error(f"总体进度: {final_progress['completed']}/{final_progress['total']} ({final_progress['progress_percent']:.1f}%) | 预估剩余: {final_progress['estimated_remaining']}")
+                    logger.error(f"===== 简化版 priority_limit_async_func_call 失败 =====")
+                    raise
 
-            # Try to put the task into the queue, supporting timeout
-            try:
-                if _queue_timeout is not None:
-                    # Use timeout to wait for queue space
-                    try:
-                        await asyncio.wait_for(
-                            # current_count is used to ensure FIFO order
-                            queue.put((_priority, current_count, future, args, kwargs)),
-                            timeout=_queue_timeout,
-                        )
-                    except asyncio.TimeoutError:
-                        raise QueueFullError(
-                            f"Queue full, timeout after {_queue_timeout} seconds"
-                        )
-                else:
-                    # No timeout, may wait indefinitely
-                    # current_count is used to ensure FIFO order
-                    await queue.put((_priority, current_count, future, args, kwargs))
-            except Exception as e:
-                # Clean up the future
-                if not future.done():
-                    future.set_exception(e)
-                active_futures.discard(future)
-                raise
+        # 添加一个空的shutdown方法，保持接口兼容性
+        async def shutdown():
+            """空的关闭方法，保持接口兼容性"""
+            logger.info("简化版 priority_limit_async_func_call: 无需特殊关闭操作")
+            pass
 
-            try:
-                # Wait for the result, optional timeout
-                if _timeout is not None:
-                    try:
-                        return await asyncio.wait_for(future, _timeout)
-                    except asyncio.TimeoutError:
-                        # Cancel the future
-                        if not future.done():
-                            future.cancel()
-                        raise TimeoutError(
-                            f"limit_async: Task timed out after {_timeout} seconds"
-                        )
-                else:
-                    # Wait for the result without timeout
-                    return await future
-            finally:
-                # Clean up the future reference
-                active_futures.discard(future)
+        def get_stats():
+            """获取当前统计信息"""
+            return get_progress_info()
+        
+        def reset_stats():
+            """重置统计信息"""
+            nonlocal counter, completed_tasks, total_tasks, execution_times
+            counter = 0
+            completed_tasks = 0
+            total_tasks = 0
+            execution_times.clear()
+            logger.info("统计信息已重置")
 
-        # Add the shutdown method to the decorated function
         wait_func.shutdown = shutdown
-
+        wait_func.get_stats = get_stats
+        wait_func.reset_stats = reset_stats
         return wait_func
 
     return final_decro
@@ -1667,7 +1600,7 @@ def normalize_extracted_info(name: str, is_entity=False) -> str:
 
     if is_entity:
         # remove Chinese quotes
-        name = name.replace("“", "").replace("”", "").replace("‘", "").replace("’", "")
+        name = name.replace(""", "").replace(""", "").replace("'", "").replace("'", "")
         # remove English queotes in and around chinese
         name = re.sub(r"['\"]+(?=[\u4e00-\u9fa5])", "", name)
         name = re.sub(r"(?<=[\u4e00-\u9fa5])['\"]+", "", name)
