@@ -23,8 +23,12 @@ from lightrag.utils import (
     locate_json_string_body_from_string,
     safe_unicode_decode,
 )
+from ..rate_limiter import create_rate_limiter
 
 import numpy as np
+
+# 全局Azure OpenAI频率限制器实例
+azure_embedding_rate_limiter = create_rate_limiter("azure_openai")
 
 
 @retry(
@@ -133,6 +137,9 @@ async def azure_openai_embed(
     if api_version:
         os.environ["AZURE_OPENAI_API_VERSION"] = api_version
 
+    # 请求频率控制
+    await azure_embedding_rate_limiter.acquire(texts)
+
     openai_async_client = AsyncAzureOpenAI(
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_deployment=model,
@@ -143,4 +150,9 @@ async def azure_openai_embed(
     response = await openai_async_client.embeddings.create(
         model=model, input=texts, encoding_format="float"
     )
+    
+    # 更新实际token使用量（如果有的话）
+    if hasattr(response, 'usage') and hasattr(response.usage, 'total_tokens'):
+        await azure_embedding_rate_limiter.acquire_with_actual_tokens(response.usage.total_tokens)
+    
     return np.array([dp.embedding for dp in response.data])

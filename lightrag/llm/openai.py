@@ -51,61 +51,14 @@ load_dotenv(dotenv_path=".env", override=False)
 # Default embedding model
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 
-# Global LLM request rate limiter
-class LLMRateLimiter:
-    def __init__(self, rpm: int = 1000, tpm: int = 10000):
-        self.rpm = rpm  # 每分钟请求数限制
-        self.tpm = tpm  # 每分钟token数限制
-        self.request_times = []  # 请求时间记录
-        self.token_usage = []   # token使用记录
-        self.lock = asyncio.Lock()
-    
-    def estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
-        """预估消息的token数量（简单估算：1个token约等于4个字符）"""
-        total_chars = 0
-        for message in messages:
-            if isinstance(message.get("content"), str):
-                total_chars += len(message["content"])
-        return max(1, total_chars // 4)
-    
-    async def acquire(self, messages: list[dict[str, Any]]):
-        """获取请求许可，确保不超过频率限制"""
-        async with self.lock:
-            current_time = time.time()
-            estimated_tokens = self.estimate_tokens(messages)
-            
-            # 清理1分钟前的记录
-            cutoff_time = current_time - 60
-            self.request_times = [t for t in self.request_times if t > cutoff_time]
-            self.token_usage = [(t, tokens) for t, tokens in self.token_usage if t > cutoff_time]
-            
-            # 检查RPM限制
-            if len(self.request_times) >= self.rpm:
-                wait_time = 60 - (current_time - self.request_times[0])
-                if wait_time > 0:
-                    logger.info(f"⏰ LLM RPM限制，等待 {wait_time:.2f} 秒")
-                    await asyncio.sleep(wait_time)
-                    return await self.acquire(messages)
-            
-            # 检查TPM限制
-            current_tokens = sum(tokens for _, tokens in self.token_usage)
-            if current_tokens + estimated_tokens > self.tpm:
-                if self.token_usage:
-                    wait_time = 60 - (current_time - self.token_usage[0][0])
-                    if wait_time > 0:
-                        logger.info(f"⏰ LLM TPM限制，当前tokens: {current_tokens}, 预估需要: {estimated_tokens}, 等待 {wait_time:.2f} 秒")
-                        await asyncio.sleep(wait_time)
-                        return await self.acquire(messages)
-            
-            # 记录本次请求
-            self.request_times.append(current_time)
-            self.token_usage.append((current_time, estimated_tokens))
-            
-            # 添加基础间隔，避免请求过于密集
-            await asyncio.sleep(0.1)
+# 导入通用频率限制器
+from ..rate_limiter import create_rate_limiter
 
-# 全局LLM频率限制器实例（设置为限制的80%，留出安全边际）
-llm_rate_limiter = LLMRateLimiter(rpm=100, tpm=4000000)
+# 全局LLM频率限制器实例
+llm_rate_limiter = create_rate_limiter("openai_tier1")
+
+# 全局Embedding频率限制器实例
+embedding_rate_limiter = create_rate_limiter("openai_tier1")
 
 
 class InvalidResponseError(Exception):
@@ -514,6 +467,9 @@ async def openai_embed(
         RateLimitError: If the OpenAI API rate limit is exceeded.
         APITimeoutError: If the OpenAI API request times out.
     """
+    # 请求频率控制
+    await embedding_rate_limiter.acquire(texts)
+
     # Create the OpenAI client
     openai_async_client = create_openai_async_client(
         api_key=api_key, base_url=base_url, client_configs=client_configs
@@ -523,4 +479,9 @@ async def openai_embed(
         response = await openai_async_client.embeddings.create(
             model=model, input=texts, encoding_format="float"
         )
+        
+        # 更新实际token使用量（如果有的话）
+        if hasattr(response, 'usage') and hasattr(response.usage, 'total_tokens'):
+            await embedding_rate_limiter.acquire_with_actual_tokens(response.usage.total_tokens)
+        
         return np.array([dp.embedding for dp in response.data])

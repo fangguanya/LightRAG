@@ -138,7 +138,8 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 "basic": {"max_retries": 3, "retry_delay": 2, "max_circuit_failures": 2},
                 "extended": {"enabled": True, "delay": 30, "max_retries": 10},
                 "task": {"max_retries": 2, "timeout": 60},
-                "overall": {"timeout": 60}
+                "overall": {"timeout": 60},
+                "fast_fail": {"max_total_runtime": 1800, "max_circuit_breaker_count": 100}
             }
         
         # 添加重试机制和熔断机制的embedding计算 - 支持延迟等待后持续重试
@@ -152,8 +153,27 @@ class NanoVectorDBStorage(BaseVectorStorage):
         extended_retry_delay = retry_config["extended"]["delay"]
         extended_max_retries = retry_config["extended"]["max_retries"]
         
+        # 添加系统性故障快速终止机制
+        max_total_runtime = retry_config["fast_fail"]["max_total_runtime"]
+        max_circuit_breaker_count = retry_config["fast_fail"]["max_circuit_breaker_count"]
+        start_runtime = time.time()
+        logger.info(f"快速终止配置: 最大运行时间={max_total_runtime/60:.1f}分钟, 最大熔断计数={max_circuit_breaker_count}")
+        
         retry_attempt = 0
         while True:
+            # 检查总运行时间限制
+            current_runtime = time.time() - start_runtime
+            if current_runtime > max_total_runtime:
+                logger.error(f"embedding计算总运行时间超过限制 ({max_total_runtime/60:.1f} 分钟)，强制终止")
+                logger.error(f"当前运行时间: {current_runtime:.1f} 秒，熔断器故障计数: {circuit_breaker_failures}")
+                raise Exception(f"embedding计算运行时间超限强制终止 (运行时间: {current_runtime:.1f}秒，熔断器: {circuit_breaker_failures} 次失败)")
+            
+            # 检查熔断器故障计数限制 - 防止系统性故障无限重试
+            if circuit_breaker_failures > max_circuit_breaker_count:
+                logger.error(f"熔断器故障计数超过限制 ({max_circuit_breaker_count})，判定为系统性故障，强制终止")
+                logger.error(f"当前故障计数: {circuit_breaker_failures}，运行时间: {current_runtime:.1f} 秒")
+                logger.error("建议检查: 1) API密钥是否有效 2) 网络连接是否正常 3) embedding服务是否可用")
+                raise Exception(f"embedding计算系统性故障强制终止 (熔断器: {circuit_breaker_failures} 次失败，运行时间: {current_runtime:.1f}秒)")
             try:
                 if retry_attempt > 0:
                     if retry_attempt <= max_retries:

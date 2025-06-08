@@ -36,58 +36,11 @@ import math
 # 设置日志记录器
 logger = logging.getLogger(__name__)
 
-# 全局请求频率控制器
-class RateLimiter:
-    def __init__(self, rpm: int = 5000, tpm: int = 1000000):
-        self.rpm = rpm  # 每分钟请求数限制
-        self.tpm = tpm  # 每分钟token数限制
-        self.request_times = []  # 请求时间记录
-        self.token_usage = []   # token使用记录
-        self.lock = asyncio.Lock()
-    
-    def estimate_tokens(self, texts: List[str]) -> int:
-        """预估文本的token数量（简单估算：1个token约等于4个字符）"""
-        total_chars = sum(len(text) for text in texts)
-        return max(1, total_chars // 4)
-    
-    async def acquire(self, texts: List[str]):
-        """获取请求许可，确保不超过频率限制"""
-        async with self.lock:
-            current_time = time.time()
-            estimated_tokens = self.estimate_tokens(texts)
-            
-            # 清理1分钟前的记录
-            cutoff_time = current_time - 60
-            self.request_times = [t for t in self.request_times if t > cutoff_time]
-            self.token_usage = [(t, tokens) for t, tokens in self.token_usage if t > cutoff_time]
-            
-            # 检查RPM限制
-            if len(self.request_times) >= self.rpm:
-                wait_time = 60 - (current_time - self.request_times[0])
-                if wait_time > 0:
-                    #logger.info(f"RPM限制，等待 {wait_time:.2f} 秒")
-                    await asyncio.sleep(wait_time)
-                    return await self.acquire(texts)
-            
-            # 检查TPM限制
-            current_tokens = sum(tokens for _, tokens in self.token_usage)
-            if current_tokens + estimated_tokens > self.tpm:
-                if self.token_usage:
-                    wait_time = 60 - (current_time - self.token_usage[0][0])
-                    if wait_time > 0:
-                        #logger.info(f"TPM限制，当前tokens: {current_tokens}, 预估需要: {estimated_tokens}, 等待 {wait_time:.2f} 秒")
-                        await asyncio.sleep(wait_time)
-                        return await self.acquire(texts)
-            
-            # 记录本次请求
-            self.request_times.append(current_time)
-            self.token_usage.append((current_time, estimated_tokens))
-            
-            # 添加基础间隔，避免请求过于密集
-            await asyncio.sleep(0.1)
+# 导入通用频率限制器
+from ..rate_limiter import create_rate_limiter
 
-# 全局频率限制器实例
-rate_limiter = RateLimiter(rpm=4000, tpm=800000)  # 设置为限制的80%，留出安全边际
+# 全局SiliconFlow频率限制器实例
+rate_limiter = create_rate_limiter("siliconflow")
 
 
 @retry(

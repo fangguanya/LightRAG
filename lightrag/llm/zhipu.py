@@ -29,8 +29,12 @@ from lightrag.utils import (
     wrap_embedding_func_with_attrs,
     logger,
 )
+from ..rate_limiter import create_rate_limiter
 
 from lightrag.types import GPTKeywordExtractionFormat
+
+# 全局智谱频率限制器实例
+zhipu_embedding_rate_limiter = create_rate_limiter("zhipu")
 
 import numpy as np
 from typing import Union, List, Optional, Dict
@@ -178,6 +182,9 @@ async def zhipu_complete(
 async def zhipu_embedding(
     texts: list[str], model: str = "embedding-3", api_key: str = None, **kwargs
 ) -> np.ndarray:
+    # 请求频率控制
+    await zhipu_embedding_rate_limiter.acquire(texts)
+
     # dynamically load ZhipuAI
     try:
         from zhipuai import ZhipuAI
@@ -195,11 +202,20 @@ async def zhipu_embedding(
         texts = [texts]
 
     embeddings = []
+    total_tokens = 0
     for text in texts:
         try:
             response = client.embeddings.create(model=model, input=[text], **kwargs)
             embeddings.append(response.data[0].embedding)
+            
+            # 累计token使用量（如果有的话）
+            if hasattr(response, 'usage') and hasattr(response.usage, 'total_tokens'):
+                total_tokens += response.usage.total_tokens
         except Exception as e:
             raise Exception(f"Error calling ChatGLM Embedding API: {str(e)}")
+
+    # 更新实际token使用量
+    if total_tokens > 0:
+        await zhipu_embedding_rate_limiter.acquire_with_actual_tokens(total_tokens)
 
     return np.array(embeddings)

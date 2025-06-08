@@ -31,6 +31,12 @@ OVERALL_TIMEOUT_CONFIG = {
     "timeout": 60,             # embedding计算总体超时时间（秒）
 }
 
+# 系统性故障快速终止配置
+FAST_FAIL_CONFIG = {
+    "max_total_runtime": 1800,      # 最大总运行时间（秒），默认30分钟
+    "max_circuit_breaker_count": 100,  # 熔断器最大故障计数，超过则判定为系统性故障
+}
+
 def get_retry_config():
     """获取完整的重试配置"""
     return {
@@ -38,6 +44,7 @@ def get_retry_config():
         "extended": EXTENDED_RETRY_CONFIG,
         "task": TASK_RETRY_CONFIG,
         "overall": OVERALL_TIMEOUT_CONFIG,
+        "fast_fail": FAST_FAIL_CONFIG,
     }
 
 def update_retry_config(**kwargs):
@@ -54,6 +61,8 @@ def update_retry_config(**kwargs):
             - task_max_retries: 单个任务最大重试次数
             - task_timeout: 单个任务超时时间（秒）
             - overall_timeout: 总体超时时间（秒）
+            - fast_fail_max_runtime: 最大总运行时间（秒）
+            - fast_fail_max_circuit_count: 熔断器最大故障计数
     """
     # 更新基本重试配置
     if "basic_max_retries" in kwargs:
@@ -80,6 +89,12 @@ def update_retry_config(**kwargs):
     # 更新总体超时配置
     if "overall_timeout" in kwargs:
         OVERALL_TIMEOUT_CONFIG["timeout"] = kwargs["overall_timeout"]
+    
+    # 更新快速终止配置
+    if "fast_fail_max_runtime" in kwargs:
+        FAST_FAIL_CONFIG["max_total_runtime"] = kwargs["fast_fail_max_runtime"]
+    if "fast_fail_max_circuit_count" in kwargs:
+        FAST_FAIL_CONFIG["max_circuit_breaker_count"] = kwargs["fast_fail_max_circuit_count"]
 
 # 预设配置模板
 PRESET_CONFIGS = {
@@ -93,6 +108,8 @@ PRESET_CONFIGS = {
         "task_max_retries": 1,
         "task_timeout": 30,
         "overall_timeout": 30,
+        "fast_fail_max_runtime": 600,  # 10分钟
+        "fast_fail_max_circuit_count": 20,
     },
     "aggressive": {
         # 激进策略：大量重试，长延迟
@@ -104,6 +121,8 @@ PRESET_CONFIGS = {
         "task_max_retries": 3,
         "task_timeout": 120,
         "overall_timeout": 120,
+        "fast_fail_max_runtime": 3600,  # 60分钟
+        "fast_fail_max_circuit_count": 500,
     },
     "balanced": {
         # 平衡策略：中等重试，适中延迟（默认）
@@ -115,6 +134,8 @@ PRESET_CONFIGS = {
         "task_max_retries": 2,
         "task_timeout": 60,
         "overall_timeout": 60,
+        "fast_fail_max_runtime": 1800,  # 30分钟
+        "fast_fail_max_circuit_count": 100,
     },
     "no_extended_retry": {
         # 禁用延迟等待后持续重试
@@ -126,6 +147,8 @@ PRESET_CONFIGS = {
         "task_max_retries": 2,
         "task_timeout": 60,
         "overall_timeout": 60,
+        "fast_fail_max_runtime": 900,  # 15分钟
+        "fast_fail_max_circuit_count": 50,
     }
 }
 
