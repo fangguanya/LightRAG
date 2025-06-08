@@ -127,24 +127,65 @@ class NanoVectorDBStorage(BaseVectorStorage):
         logger.info(f"开始执行embedding计算...")
         embedding_start_time = time.time()
         
-        # 添加重试机制和熔断机制的embedding计算
-        max_retries = 3
-        retry_delay = 2  # 秒
-        circuit_breaker_failures = 0  # 熔断器故障计数
-        max_circuit_failures = 2  # 最大连续失败次数
+        # 加载重试配置
+        try:
+            from ..retry_config import get_retry_config
+            retry_config = get_retry_config()
+            logger.info(f"已加载重试配置: {retry_config}")
+        except ImportError:
+            logger.warning("未找到retry_config模块，使用默认重试配置")
+            retry_config = {
+                "basic": {"max_retries": 3, "retry_delay": 2, "max_circuit_failures": 2},
+                "extended": {"enabled": True, "delay": 30, "max_retries": 10},
+                "task": {"max_retries": 2, "timeout": 60},
+                "overall": {"timeout": 60}
+            }
         
-        for retry_attempt in range(max_retries + 1):
+        # 添加重试机制和熔断机制的embedding计算 - 支持延迟等待后持续重试
+        max_retries = retry_config["basic"]["max_retries"]
+        retry_delay = retry_config["basic"]["retry_delay"]
+        circuit_breaker_failures = 0  # 熔断器故障计数
+        max_circuit_failures = retry_config["basic"]["max_circuit_failures"]
+        
+        # 延迟等待后持续重试的配置
+        extended_retry_enabled = retry_config["extended"]["enabled"]
+        extended_retry_delay = retry_config["extended"]["delay"]
+        extended_max_retries = retry_config["extended"]["max_retries"]
+        
+        retry_attempt = 0
+        while True:
             try:
                 if retry_attempt > 0:
-                    logger.info(f"embedding计算重试 {retry_attempt}/{max_retries}...")
-                    
-                    # 如果连续失败次数过多，增加延迟
-                    if circuit_breaker_failures >= max_circuit_failures:
-                        extended_delay = retry_delay * retry_attempt * 2
-                        logger.warning(f"检测到连续失败，启用熔断延迟: {extended_delay} 秒")
-                        await asyncio.sleep(extended_delay)
+                    if retry_attempt <= max_retries:
+                        logger.info(f"embedding计算重试 {retry_attempt}/{max_retries}...")
+                        
+                        # 如果连续失败次数过多，增加延迟
+                        if circuit_breaker_failures >= max_circuit_failures:
+                            extended_delay = retry_delay * retry_attempt * 2
+                            logger.warning(f"检测到连续失败，启用熔断延迟: {extended_delay} 秒")
+                            await asyncio.sleep(extended_delay)
+                        else:
+                            await asyncio.sleep(retry_delay * retry_attempt)  # 递增延迟
                     else:
-                        await asyncio.sleep(retry_delay * retry_attempt)  # 递增延迟
+                        # 超过基本重试次数，进入延迟等待后持续重试模式
+                        if extended_retry_enabled and retry_attempt <= max_retries + extended_max_retries:
+                            extended_retry_num = retry_attempt - max_retries
+                            logger.warning(f"基本重试已耗尽，启用延迟等待后持续重试 {extended_retry_num}/{extended_max_retries}...")
+                            logger.warning(f"延迟等待 {extended_retry_delay} 秒后继续重试...")
+                            await asyncio.sleep(extended_retry_delay)
+                        else:
+                            # 所有重试机会都用完了
+                            logger.error("embedding计算已达最大重试次数（包括延迟等待重试），放弃处理")
+                            logger.error(f"最终熔断器状态: {circuit_breaker_failures} 次失败")
+                            
+                            # 提供降级策略建议
+                            if circuit_breaker_failures >= max_circuit_failures:
+                                logger.error("建议检查embedding服务状态或网络连接")
+                                logger.error("可能的解决方案: 1) 检查API密钥 2) 检查网络 3) 减少批处理大小")
+                            
+                            raise Exception(f"embedding计算彻底失败 (熔断器: {circuit_breaker_failures} 次失败，总重试: {retry_attempt} 次): embedding计算总体超时，已达最大重试次数")
+                
+                retry_attempt += 1
                 
                 # Execute embedding outside of lock to avoid long lock times
                 embedding_tasks = []
@@ -153,7 +194,8 @@ class NanoVectorDBStorage(BaseVectorStorage):
                     
                     # 为每个embedding任务添加单独的重试和超时
                     async def embedding_task_with_retry(batch_content, task_id=i+1):
-                        task_max_retries = 2
+                        task_max_retries = retry_config["task"]["max_retries"]
+                        task_timeout = retry_config["task"]["timeout"]
                         for task_retry in range(task_max_retries + 1):
                             try:
                                 if task_retry > 0:
@@ -163,7 +205,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
                                 # 为单个embedding任务设置超时
                                 result = await asyncio.wait_for(
                                     self.embedding_func(batch_content),
-                                    timeout=60  # 2分钟超时
+                                    timeout=task_timeout
                                 )
                                 logger.info(f"embedding任务 {task_id} 完成，返回 {len(result)} 个向量")
                                 return result
@@ -192,7 +234,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 logger.info(f"等待 {len(embedding_tasks)} 个embedding任务完成...")
                 
                 # 设置总体超时，避免无限等待
-                total_embedding_timeout = 60  # 10分钟总超时
+                total_embedding_timeout = retry_config["overall"]["timeout"]
                 try:
                     embeddings_list = await asyncio.wait_for(
                         asyncio.gather(*embedding_tasks, return_exceptions=True),
@@ -244,24 +286,8 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 logger.error(f"错误类型: {type(e).__name__}")
                 logger.error(f"熔断器故障计数: {circuit_breaker_failures}")
                 
-                if retry_attempt < max_retries:
-                    next_delay = retry_delay * (retry_attempt + 1)
-                    if circuit_breaker_failures >= max_circuit_failures:
-                        next_delay *= 2  # 熔断延迟
-                        logger.warning(f"熔断器激活，将在 {next_delay} 秒后重试embedding计算...")
-                    else:
-                        logger.info(f"将在 {next_delay} 秒后重试embedding计算...")
-                    continue
-                else:
-                    logger.error("embedding计算已达最大重试次数，放弃处理")
-                    logger.error(f"最终熔断器状态: {circuit_breaker_failures} 次失败")
-                    
-                    # 提供降级策略建议
-                    if circuit_breaker_failures >= max_circuit_failures:
-                        logger.error("建议检查embedding服务状态或网络连接")
-                        logger.error("可能的解决方案: 1) 检查API密钥 2) 检查网络 3) 减少批处理大小")
-                    
-                    raise Exception(f"embedding计算彻底失败 (熔断器: {circuit_breaker_failures} 次失败): {str(e)}")
+                # 继续重试循环，不退出
+                continue
         
         # 如果到达这里说明重试成功了
         logger.info("embedding计算重试成功！")
