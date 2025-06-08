@@ -45,6 +45,10 @@ class UniversalRateLimiter:
         self.effective_rpm = int(self.config.rpm * self.config.safety_margin)
         self.effective_tpm = int(self.config.tpm * self.config.safety_margin)
         
+        # 向后兼容性：提供直接访问原始配置的属性
+        self.rpm = self.config.rpm
+        self.tpm = self.config.tpm
+        
         logger.info(f"初始化频率限制器: RPM={self.effective_rpm}, TPM={self.effective_tpm}")
     
     def estimate_tokens_from_texts(self, texts: List[str]) -> int:

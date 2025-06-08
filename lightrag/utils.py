@@ -383,7 +383,7 @@ def priority_limit_async_func_call(max_size: int, max_queue_size: int = 1000):
         
         @wraps(func)
         async def wait_func(
-            *args, _priority=10, _timeout=None, _queue_timeout=None, **kwargs
+            *args, _priority=10, _timeout=30, _queue_timeout=600, **kwargs
         ):
             """
             逐个执行函数调用
@@ -416,7 +416,7 @@ def priority_limit_async_func_call(max_size: int, max_queue_size: int = 1000):
             logger.info(f"函数: {func.__name__ if hasattr(func, '__name__') else 'anonymous'}")
             logger.info(f"任务编号: {current_count} | 进度: {progress['completed']}/{progress['total']} ({progress['progress_percent']:.1f}%)")
             logger.info(f"参数数量: {len(args)} 个位置参数, {len(kwargs)} 个关键字参数")
-            logger.info(f"超时设置: {_timeout} 秒")
+            logger.info(f"超时设置: {_timeout} 秒, 队列超时: {_queue_timeout} 秒")
             if progress['avg_execution_time'] > 0:
                 logger.info(f"平均执行时间: {progress['avg_execution_time']:.2f}秒 | 预估剩余时间: {progress['estimated_remaining']}")
             
