@@ -8,8 +8,8 @@ LightRAG embedding计算重试配置
 
 # 基本重试配置
 BASIC_RETRY_CONFIG = {
-    "max_retries": 3,           # 基本重试次数
-    "retry_delay": 2,           # 基本重试间隔（秒）
+    "max_retries": 10,           # 基本重试次数
+    "retry_delay": 15,           # 基本重试间隔（秒）
     "max_circuit_failures": 2,  # 熔断器触发的最大连续失败次数
 }
 
@@ -22,13 +22,13 @@ EXTENDED_RETRY_CONFIG = {
 
 # embedding任务级别重试配置
 TASK_RETRY_CONFIG = {
-    "max_retries": 2,          # 单个embedding任务最大重试次数
+    "max_retries": 20,          # 单个embedding任务最大重试次数
     "timeout": 60,             # 单个embedding任务超时时间（秒）
 }
 
 # 总体超时配置
 OVERALL_TIMEOUT_CONFIG = {
-    "timeout": 60,             # embedding计算总体超时时间（秒）
+    "timeout": 30,             # embedding计算总体超时时间（秒）
 }
 
 # 系统性故障快速终止配置

@@ -135,9 +135,9 @@ class NanoVectorDBStorage(BaseVectorStorage):
         except ImportError:
             logger.warning("未找到retry_config模块，使用默认重试配置")
             retry_config = {
-                "basic": {"max_retries": 3, "retry_delay": 2, "max_circuit_failures": 2},
+                "basic": {"max_retries": 30, "retry_delay": 15, "max_circuit_failures": 2},
                 "extended": {"enabled": True, "delay": 30, "max_retries": 10},
-                "task": {"max_retries": 2, "timeout": 60},
+                "task": {"max_retries": 20, "timeout": 60},
                 "overall": {"timeout": 60},
                 "fast_fail": {"max_total_runtime": 1800, "max_circuit_breaker_count": 100}
             }
@@ -220,7 +220,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
                             try:
                                 if task_retry > 0:
                                     logger.warning(f"embedding任务 {task_id} 重试 {task_retry}/{task_max_retries}")
-                                    await asyncio.sleep(1)
+                                    await asyncio.sleep(20)
                                 
                                 # 为单个embedding任务设置超时
                                 result = await asyncio.wait_for(
@@ -231,9 +231,9 @@ class NanoVectorDBStorage(BaseVectorStorage):
                                 return result
                                 
                             except asyncio.TimeoutError as te:
-                                logger.error(f"embedding任务 {task_id} 超时 (尝试 {task_retry + 1}/{task_max_retries + 1})")
+                                logger.error(f"embedding任务 {task_id} 超时 (尝试 {task_retry + 1}/{task_max_retries + 1}), 超时时间: {task_timeout} 秒")
                                 if task_retry == task_max_retries:
-                                    logger.error(f"embedding任务 {task_id} 超时失败，已达最大重试次数")
+                                    logger.error(f"embedding任务 {task_id} 超时失败，已达最大重试次数, 超时时间: {task_timeout} 秒")
                                     raise
                                 continue
                                 
@@ -258,7 +258,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 try:
                     embeddings_list = await asyncio.wait_for(
                         asyncio.gather(*embedding_tasks, return_exceptions=True),
-                        timeout=total_embedding_timeout
+                        timeout=len(embedding_tasks) * total_embedding_timeout
                     )
                     
                     # 检查是否有任务返回异常
